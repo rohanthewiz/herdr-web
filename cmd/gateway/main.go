@@ -15,6 +15,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/rohanthewiz/herdr-web/internal/herdrconn"
 	"github.com/rohanthewiz/herdr-web/internal/wire"
@@ -23,6 +25,67 @@ import (
 
 //go:embed web/index.html
 var webFS embed.FS
+
+// titles broadcasts browser-tab titles to every connected browser pump. herdr
+// itself forwards no usable window title, so this is how an external source —
+// e.g. a Claude Code Stop hook POSTing the session's ai-title — drives
+// document.title in the page.
+var titles = newTitleHub()
+
+// titleHub fans a pushed title out to all connected browser pumps and remembers
+// the latest so a freshly-connected browser picks it up immediately.
+type titleHub struct {
+	mu      sync.Mutex
+	latest  string
+	clients map[chan string]struct{}
+}
+
+func newTitleHub() *titleHub {
+	return &titleHub{clients: make(map[chan string]struct{})}
+}
+
+// subscribe registers a pump and returns its update channel plus an
+// unsubscribe func. If a title is already set it is delivered right away.
+func (t *titleHub) subscribe() (<-chan string, func()) {
+	ch := make(chan string, 1)
+	t.mu.Lock()
+	t.clients[ch] = struct{}{}
+	if t.latest != "" {
+		ch <- t.latest
+	}
+	t.mu.Unlock()
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			t.mu.Lock()
+			delete(t.clients, ch)
+			close(ch)
+			t.mu.Unlock()
+		})
+	}
+}
+
+// broadcast records and delivers a title, coalescing so a slow pump only ever
+// sees the newest value.
+func (t *titleHub) broadcast(title string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.latest = title
+	for ch := range t.clients {
+		select {
+		case ch <- title:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- title:
+			default:
+			}
+		}
+	}
+}
 
 func main() {
 	addr := flag.String("addr", ":8420", "listen address")
@@ -42,6 +105,20 @@ func main() {
 
 	s.WebSocket("/ws", func(ws *rweb.WSConn) error {
 		return bridge(ws, *socket)
+	})
+
+	// POST /title {"title":"..."} sets the browser-tab title for all connected
+	// browsers. An empty/missing title restores the default. Intended for a
+	// Claude Code hook to advertise the running session's friendly name.
+	s.Post("/title", func(ctx rweb.Context) error {
+		var body struct {
+			Title string `json:"title"`
+		}
+		if err := json.Unmarshal(ctx.Request().Body(), &body); err != nil {
+			return ctx.Status(400).WriteString("bad json")
+		}
+		titles.broadcast(strings.TrimSpace(body.Title))
+		return ctx.WriteString("ok")
 	})
 
 	log.Printf("gateway: serving herdr at http://localhost%s (socket %s)", *addr, *socket)
@@ -93,41 +170,61 @@ func bridge(ws *rweb.WSConn, socket string) error {
 	defer h.Detach()
 
 	// herdr → browser pump (the only goroutine that writes to the WebSocket).
+	// It multiplexes herdr messages with title pushes from the hub; herdr reads
+	// happen on a helper goroutine so a quiet herdr doesn't block title updates.
+	titleCh, unsubscribe := titles.subscribe()
 	go func() {
+		defer unsubscribe()
 		var st diffState
-		for {
-			msg, err := h.Read()
-			if err != nil {
-				ws.Close(1000, "herdr closed")
-				return
-			}
-			switch msg.Kind {
-			case wire.SMWelcome:
-				if msg.Welcome != nil && msg.Welcome.Error != nil {
-					_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]string{"t": "error", "msg": *msg.Welcome.Error}))
-					ws.Close(1000, "rejected")
+		herdrMsgs := make(chan *wire.ServerMessage, 8)
+		go func() {
+			for {
+				msg, err := h.Read()
+				if err != nil {
+					close(herdrMsgs)
 					return
 				}
-			case wire.SMFrame:
-				_ = ws.WriteMessage(rweb.TextMessage, encodeFrameOrDiff(msg.Frame, &st))
-			case wire.SMClipboard:
-				if msg.Clipboard != nil {
-					_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "clipboard", "data": *msg.Clipboard}))
+				herdrMsgs <- msg
+			}
+		}()
+		for {
+			select {
+			case title := <-titleCh:
+				_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "title", "title": title}))
+				continue
+			case msg, ok := <-herdrMsgs:
+				if !ok {
+					ws.Close(1000, "herdr closed")
+					return
 				}
-			case wire.SMWindowTitle:
-				_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "title", "title": msg.WindowTitle}))
-			case wire.SMMouseCapture:
-				if msg.Mouse != nil {
-					_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "mouse", "enabled": *msg.Mouse}))
+				switch msg.Kind {
+				case wire.SMWelcome:
+					if msg.Welcome != nil && msg.Welcome.Error != nil {
+						_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]string{"t": "error", "msg": *msg.Welcome.Error}))
+						ws.Close(1000, "rejected")
+						return
+					}
+				case wire.SMFrame:
+					_ = ws.WriteMessage(rweb.TextMessage, encodeFrameOrDiff(msg.Frame, &st))
+				case wire.SMClipboard:
+					if msg.Clipboard != nil {
+						_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "clipboard", "data": *msg.Clipboard}))
+					}
+				case wire.SMWindowTitle:
+					_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "title", "title": msg.WindowTitle}))
+				case wire.SMMouseCapture:
+					if msg.Mouse != nil {
+						_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]any{"t": "mouse", "enabled": *msg.Mouse}))
+					}
+				case wire.SMNotify:
+					if msg.Notify != nil {
+						_ = ws.WriteMessage(rweb.TextMessage, notifyJSON(msg.Notify))
+					}
+				case wire.SMServerShutdown:
+					_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]string{"t": "shutdown"}))
+					ws.Close(1000, "server shutdown")
+					return
 				}
-			case wire.SMNotify:
-				if msg.Notify != nil {
-					_ = ws.WriteMessage(rweb.TextMessage, notifyJSON(msg.Notify))
-				}
-			case wire.SMServerShutdown:
-				_ = ws.WriteMessage(rweb.TextMessage, mustJSON(map[string]string{"t": "shutdown"}))
-				ws.Close(1000, "server shutdown")
-				return
 			}
 		}
 	}()
