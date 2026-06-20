@@ -264,7 +264,8 @@
     if (e.metaKey && !e.ctrlKey && isV) { e.preventDefault(); pasteText(); return; }
     if (e.metaKey && !e.ctrlKey) return; // leave other Cmd shortcuts to the browser
     let seq = null;
-    if (SPECIAL[e.key]) seq = SPECIAL[e.key];
+    if (e.key === "Tab" && e.shiftKey) seq = "\x1b[Z"; // backtab (CSI Z) — Claude Code mode cycle
+    else if (SPECIAL[e.key]) seq = SPECIAL[e.key];
     else if (e.ctrlKey && e.key.length === 1) {
       const code = e.key.toLowerCase().charCodeAt(0);
       if (code >= 97 && code <= 122) seq = String.fromCharCode(code - 96); // Ctrl-A..Z (incl. Ctrl-C interrupt)
