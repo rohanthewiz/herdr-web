@@ -177,6 +177,29 @@ channel so the Rust emulator can eventually be dropped.
   manual label > agent label** (OSC title shadows a manual label — confirmed via the option preview;
   one-line swap if that's unwanted). Chrome only, not session-persisted.
 
+### 9. OSC 8 hyperlink passthrough — commit `96bec8b` (Rust carry: herdr `5a4aa23`)
+- **Different shape from the OSC scanners:** OSC 8 is *inline per-cell* metadata (a link wraps grid
+  cells), so it rides the **frame/grid path**, not a `pane_*` event. **libghostty exposes it only via
+  `GridRef.HyperlinkURI`** (NOT the render-cell path used by the snapshot).
+- **`internal/terminal`**: `Cell.Link` (URI) + `Snapshot.HasHyperlinks`. `ghostty.go` Snapshot
+  gates per row via `RenderStateRowIterator.Raw().Hyperlink()` (cheap; may false-positive), then —
+  **after** the render iteration completes — resolves URIs with `Terminal.GridRef(viewport
+  point).HyperlinkURI()` per cell in flagged rows. GridRef (a borrowed view of terminal internals)
+  never interleaves with the render-state iterators.
+- **`protocol.go`**: `Frame.Hyperlinks []string` URI table. `FrameFromSnapshot` sends the frame
+  **full whenever any cell has a link** and builds a per-frame dedup table, each linked cell indexing
+  in. Force-full avoids cross-frame index drift (a skipped cell would keep a stale index); the cost
+  is lost diff savings while a link is on screen (links are uncommon/transient).
+- **Rust carry** (`5a4aa23`): herdr's `render_ansi` **already** emits OSC 8 from `FrameData`
+  (`cell.hyperlink` → `hyperlinks[index]`) and cells already deserialize their index — the only gap
+  was the URI table. `proto::Frame.hyperlinks` (`#[serde(default)]`) → `into_frame_data`;
+  `client.rs PaneGrid.hyperlinks` folded through `apply`/`snapshot`.
+- Tests: pure `FrameFromSnapshot` hyperlink + no-link + ghostty `TestHostReportsHyperlinkFrame`
+  (real OSC 8 via `printf`); Rust proto `frame_with_hyperlinks_carries_table_and_indices`.
+- **Limitation:** this feeds the **frame-data render path** (web/remote ANSI stream — browser sees
+  clickable links). The native-TUI mouse resolver `visible_hyperlinks` still reads the *unfed* local
+  emulator for termhost panes → TUI click-to-open won't see them yet (separate consumer; follow-up).
+
 ---
 
 ## Key facts for future me
@@ -199,7 +222,7 @@ channel so the Rust emulator can eventually be dropped.
   - Rust: `export ZIG="~/projs/go/herdr-web/.tools/zig-wrapped"`
   - Go (ghostty): `export PKG_CONFIG_PATH=~/projs/rust/herdr/vendor/libghostty-vt/zig-out/share/pkgconfig`
   - Daemon: `go build -tags ghostty -o /tmp/td ./cmd/termhost && /tmp/td --socket /tmp/x.sock`
-- **Seam events now (Go→Rust):** `welcome`, `pane_frame`, `pane_cwd`, `pane_agent`, `pane_clipboard`, `pane_title`, `pane_exited`, `error`.
+- **Seam events now (Go→Rust):** `welcome`, `pane_frame`, `pane_cwd`, `pane_agent`, `pane_clipboard`, `pane_title`, `pane_exited`, `error`. (OSC 8 hyperlinks ride `pane_frame` — `Frame.Hyperlinks` table + per-cell index — not a new event.)
 
 ## Verification (all green)
 
@@ -207,13 +230,15 @@ channel so the Rust emulator can eventually be dropped.
 - `go test ./internal/detect/` (pure, no toolchain): identify, manifest engine, all-compile.
 - `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce (8) +
   `detectthrottle` (8) + `osc` (OSC 7) + `osc52` (OSC 52, 12) + `osc9` (OSC 9, 9) +
-  `osctitle` (OSC 0/2, 8) scanners.
-- `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working + terminal + orchestration.
+  `osctitle` (OSC 0/2, 8) scanners + `FrameFromSnapshot` hyperlink table/no-link.
+- `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working/title/clipboard/hyperlink-frame
+  + terminal + orchestration.
 - gofmt/vet clean in both default and `-tags ghostty` modes.
 
 ## Commits on `roh/phase-b` (this session)
 
 ```
+96bec8b feat: OSC 8 hyperlink passthrough on the termhost seam (Go side)
 6807bbb feat: OSC 0/2 window title passthrough on the termhost seam (Go side)
 5c18aa5 feat: OSC 9 progress wired into detection (Go side)
 c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
@@ -229,9 +254,9 @@ c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
 
 - **`pane_clipboard` (OSC 52)** ✅ herdr `5ce148a`; **`pane_title` (OSC 0/2)** ✅ herdr `7f32edf`.
   (OSC 9 progress is consumed Go-side inside detection — no seam event.)
-- **Remaining termhost degradations:** scrollback, selection, hyperlinks (OSC 8), kitty graphics —
-  each needs a seam carry + Rust consumer. Hyperlinks (OSC 8) are the closest analog to the OSC
-  passthrough scanners already built.
+- **Remaining termhost degradations:** scrollback, selection, kitty graphics — each needs a seam
+  carry + Rust consumer. (OSC 8 hyperlinks ✅ item 9, for the frame-data/web render path; the
+  native-TUI click resolver is a separate follow-up.)
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
   manual `HERDR_TERMHOST_SOCKET` env + hand launch.
 - Eventually: make termhost the default and **retire the Rust in-process detector/PTY path**.
