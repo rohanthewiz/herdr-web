@@ -72,6 +72,35 @@ channel so the Rust emulator can eventually be dropped.
 - Tests: manifest unit tests (claude working/idle/blocked, pi, fallback, all-compile) +
   Host integration `TestHostReportsAgentWorkingState` (`exec -a pi sh -c 'printf Working...'`).
 
+### 4. Agent detection — Stage C: driver-parity debounce — commit `2207526`
+- **`internal/orchestration/detectstate.go`** (new, **pure / no ghostty tag** → unit-testable
+  without the emulator toolchain) — port of herdr's `src/pane/agent_detection.rs` flicker-smoothing
+  state machine. The old `detectPump` emitted on every per-tick change; this smooths it:
+  - **`pendingIdle`** debounce: a `Working→plain-Idle` drop (Idle with no visible-idle marker)
+    is held until 3 confirmations OR a 700ms cap — bypassed by visible-idle, agent change, or
+    process exit. (`shouldHoldWorkingToIdle`, mirrors `PendingIdleConfirmation`.)
+  - **content-change skip** (`shouldSkipIdleScreenScan`): while Idle + agent present + no transition
+    + unchanged PTY content-seq → skip the screen snapshot entirely.
+  - **stable-signal refresh** (`stableVisibleSignalRefreshDue` + `shouldPublishDetectionUpdate`):
+    a steady visible blocker is re-emitted every 800ms; the composed decision is
+    `decideDetectionTransition`.
+  - Tuning matched to Rust: base **300ms** (was 400ms), pending recheck **100ms**, cap **700ms**,
+    3 confirmations, stable refresh **800ms**, startup grace **3s**.
+- **`host.go` `detectPump` rewrite**: variable cadence (300ms base / 100ms while confirming a
+  pending-idle); a **newly-acquired agent publishes Idle immediately and is pinned to Idle for a
+  3s startup grace** before its first screen scan (so startup paint isn't misread as Working);
+  internal tracking of `visibleIdle/Blocker/Working` + last-refresh time. Wire protocol unchanged
+  (`pane_agent` still carries only `visible_blocker`/`visible_working`).
+- **`pane.detectSeq atomic.Uint64`**: bumped on each non-empty PTY read in `readPump`
+  (mirrors Rust's `observe_detection_content_change`), feeding the content-skip.
+- Tests: `detectstate_test.go` (8 pure cases — hold/cap/bypass, skip-scan, publish, refresh,
+  composed transition). `pi` working-state fixture bumped to `sleep 8` so it outlives the grace;
+  `TestHostReportsAgentWorkingState` now takes ~3.6s (direct evidence the grace gates the scan).
+- **Partial parity:** the heavy process-probe throttle (5s/30s rechecks, acquisition windows,
+  agent-presence consecutive-miss handling) is NOT ported — we still probe the foreground agent
+  every base tick. Only the pending-idle 100ms recheck cadence was ported. Follow-up if idle-pane
+  syscall cost matters.
+
 ---
 
 ## Key facts for future me
@@ -83,6 +112,9 @@ channel so the Rust emulator can eventually be dropped.
   The orchestration Host that uses it is `//go:build ghostty`.
 - **Agent label == manifest `id`.** Detection: process → identity (label); manifest →
   state (given the label). Both needed.
+- **Detection publishing is debounced (Stage C), not raw.** `detectstate.go` is the pure,
+  unit-testable parity port; `detectPump` drives it. Startup grace (3s) means a fresh agent
+  reads Idle for ~3s before its first real scan — tests/fixtures must outlive that window.
 - **Build/run env:**
   - Rust: `export ZIG="~/projs/go/herdr-web/.tools/zig-wrapped"`
   - Go (ghostty): `export PKG_CONFIG_PATH=~/projs/rust/herdr/vendor/libghostty-vt/zig-out/share/pkgconfig`
@@ -93,22 +125,26 @@ channel so the Rust emulator can eventually be dropped.
 
 - Default `go build ./...` (cgo on); `-tags ghostty` build.
 - `go test ./internal/detect/` (pure, no toolchain): identify, manifest engine, all-compile.
+- `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce machine (8 cases).
 - `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working + terminal + orchestration.
-- gofmt/vet clean.
+- gofmt/vet clean in both default and `-tags ghostty` modes.
 
 ## Commits on `roh/phase-b` (this session)
 
 ```
+2207526 feat: Stage C — driver-parity detection debounce (Go side)
 5b7e723 feat: manifest-driven agent state detection in Go (Stage B)
 156be75 feat: agent detection in Go — process identity (Stage A)
 1a8220f feat: OSC 7 cwd passthrough on the termhost seam (Go side)
 ```
+(pushed to `origin/roh/phase-b`)
 
 ## Next steps
 
-- **Stage C — driver parity:** pending-idle debounce (3 confirmations / ≤700ms), 3s
-  startup grace, content-change skip, process re-check cadences. The detector currently
-  emits on every change at 400ms; Stage C smooths flicker to match the Rust detector.
+- **Stage C — process-probe throttle (the un-ported remainder):** port herdr's foreground
+  process-group recheck cadences (5s identified / 30s missing-group), acquisition windows, and
+  agent-presence consecutive-miss handling. The debounce/grace/content-skip half shipped in
+  `2207526`; this half cuts idle-pane syscall churn (we currently probe every 300ms tick).
 - **OSC 52 clipboard:** extend `oscScanner` to OSC 52 (+ base64) → `pane_clipboard` event.
 - **OSC 9 progress:** raw-scan for richer Claude idle/working rules.
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
