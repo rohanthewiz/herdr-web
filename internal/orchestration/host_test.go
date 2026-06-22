@@ -171,6 +171,40 @@ func TestHostReportsAgent(t *testing.T) {
 	t.Fatal("never received pane_agent with agent=codex")
 }
 
+func TestHostReportsAgentWorkingState(t *testing.T) {
+	c := startTestHost(t)
+
+	cp := NewCreatePane(5, 40, 5)
+	cp.Command = "/bin/sh"
+	// A foreground process named "pi" (agent) that prints the pi manifest's
+	// working marker — exercises identity + manifest state classification.
+	cp.Args = []string{"-c", `exec -a pi sh -c 'printf "Working..."; sleep 3'`}
+	if err := WriteMessage(c, cp); err != nil {
+		t.Fatalf("create_pane: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		typ, payload := readEvent(t, c)
+		switch typ {
+		case MsgPaneAgent:
+			var pa PaneAgent
+			if err := json.Unmarshal(payload, &pa); err != nil {
+				t.Fatalf("decode pane_agent: %v", err)
+			}
+			if pa.Agent == "pi" && pa.State == "working" {
+				if !pa.VisibleWorking {
+					t.Errorf("expected visible_working for working state")
+				}
+				return
+			}
+		case MsgError:
+			t.Fatalf("unexpected error event: %s", string(payload))
+		}
+	}
+	t.Fatal("never received pane_agent with agent=pi state=working")
+}
+
 func TestHostInputEchoAndClose(t *testing.T) {
 	c := startTestHost(t)
 

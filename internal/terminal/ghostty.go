@@ -92,6 +92,10 @@ func (e *ghosttyEmulator) Resize(cols, rows uint16) error {
 	return nil
 }
 
+func (e *ghosttyEmulator) Title() (string, error) {
+	return e.term.Title()
+}
+
 func (e *ghosttyEmulator) Snapshot() (*Snapshot, error) {
 	if err := e.rs.Update(e.term); err != nil {
 		return nil, fmt.Errorf("terminal: render update: %w", err)

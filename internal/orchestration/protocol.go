@@ -150,8 +150,15 @@ type PaneAgent struct {
 	VisibleWorking bool        `json:"visible_working"`
 }
 
-func NewPaneAgent(id uint32, agent, state string) PaneAgent {
-	return PaneAgent{Type: MsgPaneAgent, PaneID: id, Agent: agent, State: state}
+func NewPaneAgent(id uint32, agent, state string, visibleBlocker, visibleWorking bool) PaneAgent {
+	return PaneAgent{
+		Type:           MsgPaneAgent,
+		PaneID:         id,
+		Agent:          agent,
+		State:          state,
+		VisibleBlocker: visibleBlocker,
+		VisibleWorking: visibleWorking,
+	}
 }
 
 type PaneExited struct {

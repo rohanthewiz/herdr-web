@@ -85,6 +85,9 @@ type Emulator interface {
 	// Snapshot returns a copied view of the current grid + cursor.
 	Snapshot() (*Snapshot, error)
 
+	// Title returns the window/icon title set via OSC 0/2, or "" if none.
+	Title() (string, error)
+
 	// Close releases the underlying terminal resources.
 	Close() error
 }

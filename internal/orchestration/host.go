@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -256,9 +257,9 @@ func (h *Host) readPump(p *pane) {
 }
 
 // detectPump probes the pane's foreground process group for agent identity and
-// emits a pane_agent event whenever the (agent, state) pair changes. Stage A:
-// identity only — state is idle when an agent is foreground, unknown for a plain
-// shell. Working/blocked discrimination (screen manifests) comes later.
+// runs the agent's detection manifest over the screen to classify state, emitting
+// a pane_agent event whenever the result changes. Identity is process-based; state
+// (idle/working/blocked) comes from the manifest rules on the screen + OSC title.
 func (h *Host) detectPump(p *pane) {
 	t := time.NewTicker(detectInterval)
 	defer t.Stop()
@@ -274,14 +275,53 @@ func (h *Host) detectPump(p *pane) {
 		}
 		agent := detect.ForegroundAgent(p.ptmx.Fd())
 		state := "unknown"
+		var vBlocker, vWorking bool
 		if agent != "" {
-			state = "idle"
+			screen, title := h.paneScreenAndTitle(p)
+			d := detect.Detect(agent, detect.Input{Screen: screen, OscTitle: title})
+			if d.SkipStateUpdate {
+				continue // e.g. transcript viewer / model picker — keep last reported state
+			}
+			state = string(d.State)
+			vBlocker = d.VisibleBlocker
+			vWorking = d.VisibleWorking
 		}
-		if key := agent + "\x00" + state; key != last {
+		key := fmt.Sprintf("%s\x00%s\x00%t\x00%t", agent, state, vBlocker, vWorking)
+		if key != last {
 			last = key
-			h.emit(NewPaneAgent(p.id, agent, state))
+			h.emit(NewPaneAgent(p.id, agent, state, vBlocker, vWorking))
 		}
 	}
+}
+
+// paneScreenAndTitle snapshots the pane's screen (rows joined by '\n', trailing
+// blanks trimmed) and OSC title for detection — all under emuMu.
+func (h *Host) paneScreenAndTitle(p *pane) (screen, title string) {
+	p.emuMu.Lock()
+	defer p.emuMu.Unlock()
+	if p.closed {
+		return "", ""
+	}
+	if t, err := p.emu.Title(); err == nil {
+		title = t
+	}
+	snap, err := p.emu.Snapshot()
+	if err != nil {
+		return "", title
+	}
+	rows := make([]string, len(snap.Cells))
+	for i, row := range snap.Cells {
+		var b strings.Builder
+		for _, cell := range row {
+			if cell.Rune == "" {
+				b.WriteByte(' ')
+			} else {
+				b.WriteString(cell.Rune)
+			}
+		}
+		rows[i] = strings.TrimRight(b.String(), " ")
+	}
+	return strings.Join(rows, "\n"), title
 }
 
 func (h *Host) feed(p *pane, b []byte) {

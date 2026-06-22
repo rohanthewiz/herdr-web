@@ -4,16 +4,16 @@ import "testing"
 
 func TestIdentifyAgent(t *testing.T) {
 	cases := map[string]string{
-		"claude":             "claude",
+		"claude":               "claude",
 		"/usr/local/bin/codex": "codex",
-		"CLAUDE-CODE":        "claude",
-		"cursor-agent":       "cursor",
-		"antigravity":        "agy",
-		"node":               "",
-		"bash":               "",
-		"zsh":                "",
-		"":                   "",
-		"claude.js":          "claude",
+		"CLAUDE-CODE":          "claude",
+		"cursor-agent":         "cursor",
+		"antigravity":          "agy",
+		"node":                 "",
+		"bash":                 "",
+		"zsh":                  "",
+		"":                     "",
+		"claude.js":            "claude",
 	}
 	for in, want := range cases {
 		if got := IdentifyAgent(in); got != want {

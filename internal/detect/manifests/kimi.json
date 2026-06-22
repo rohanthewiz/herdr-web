@@ -1,0 +1,180 @@
+{
+  "id": "kimi",
+  "version": "2026.06.10.1",
+  "min_engine_version": 1,
+  "updated_at": "2026-06-10T00:00:00Z",
+  "aliases": [
+    "kimi-code",
+    "kimi code"
+  ],
+  "rules": [
+    {
+      "id": "current_approval_panel",
+      "state": "blocked",
+      "priority": 400,
+      "region": "whole_recent",
+      "visible_blocker": true,
+      "contains": [
+        "\u21b5 confirm"
+      ],
+      "any": [
+        {
+          "contains": [
+            "run this command?"
+          ]
+        },
+        {
+          "contains": [
+            "write this file?"
+          ]
+        },
+        {
+          "contains": [
+            "apply these edits?"
+          ]
+        },
+        {
+          "contains": [
+            "stop this task?"
+          ]
+        },
+        {
+          "contains": [
+            "ready to build with this plan?"
+          ]
+        },
+        {
+          "line_regex": [
+            "(?i)^\\s*\u25b6?\\s*approve .*\\?$"
+          ]
+        }
+      ],
+      "all": [
+        {
+          "contains": [
+            " choose"
+          ]
+        },
+        {
+          "any": [
+            {
+              "contains": [
+                "approve"
+              ]
+            },
+            {
+              "contains": [
+                "reject"
+              ]
+            },
+            {
+              "contains": [
+                "revise"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "question_panel",
+      "state": "blocked",
+      "priority": 390,
+      "region": "whole_recent",
+      "visible_blocker": true,
+      "contains": [
+        "\u2191\u2193 select",
+        "esc cancel"
+      ],
+      "line_regex": [
+        "^\\s*question\\s*$",
+        "^\\s*\\? "
+      ],
+      "any": [
+        {
+          "contains": [
+            "\u21b5 choose"
+          ]
+        },
+        {
+          "contains": [
+            "\u21b5 toggle"
+          ]
+        },
+        {
+          "contains": [
+            "\u21b5 save"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy_approval_panel",
+      "state": "blocked",
+      "priority": 300,
+      "region": "whole_recent",
+      "contains": [
+        "requesting approval",
+        "reject"
+      ],
+      "any": [
+        {
+          "contains": [
+            "approve once"
+          ]
+        },
+        {
+          "contains": [
+            "approve for this session"
+          ]
+        }
+      ],
+      "all": [
+        {
+          "any": [
+            {
+              "contains": [
+                "1/2/3/4 choose"
+              ]
+            },
+            {
+              "contains": [
+                "\u21b5 confirm"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "background_agent_status_working",
+      "state": "working",
+      "priority": 120,
+      "region": "bottom_non_empty_lines(3)",
+      "visible_working": true,
+      "line_regex": [
+        "(?i)\\bkimi[-\\w.]*\\s+thinking\\b.*\\[[1-9][0-9]*\\s+agents?\\s+running\\]"
+      ]
+    },
+    {
+      "id": "moon_spinner_working",
+      "state": "working",
+      "priority": 100,
+      "region": "whole_recent",
+      "visible_working": true,
+      "line_regex": [
+        "^\\s*(\ud83c\udf15|\ud83c\udf16|\ud83c\udf17|\ud83c\udf18|\ud83c\udf11|\ud83c\udf12|\ud83c\udf13|\ud83c\udf14)\\s*$"
+      ]
+    },
+    {
+      "id": "braille_spinner_working",
+      "state": "working",
+      "priority": 90,
+      "region": "whole_recent",
+      "visible_working": true,
+      "line_regex": [
+        "(?i)^\\s*[\\u2800-\\u28FF]+\\s*(thinking\\.\\.\\.|working\\.\\.\\.|using )"
+      ]
+    }
+  ]
+}
