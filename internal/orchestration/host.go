@@ -24,10 +24,6 @@ import (
 // the Phase A requestAnimationFrame coalescing.
 const DefaultFlushInterval = 16 * time.Millisecond
 
-// detectInterval is how often a pane's foreground process group is probed for
-// agent identity.
-const detectInterval = 400 * time.Millisecond
-
 // pane is one terminal: a PTY + go-libghostty emulator + child process.
 type pane struct {
 	id   uint32
@@ -36,6 +32,10 @@ type pane struct {
 	cmd  *exec.Cmd
 
 	dirty atomic.Bool
+
+	// detectSeq counts non-empty PTY reads; detectPump uses it to skip a redundant
+	// screen scan when an idle agent has produced no new output (Stage C content-skip).
+	detectSeq atomic.Uint64
 
 	// emuMu serializes all emulator access (the emulator is not concurrency
 	// safe) and guards prev/closed.
@@ -237,6 +237,7 @@ func (h *Host) readPump(p *pane) {
 		if n > 0 {
 			h.feed(p, buf[:n])
 			p.dirty.Store(true)
+			p.detectSeq.Add(1) // mark new content for the detector's content-skip
 			// Scan the raw stream for OSC passthrough (cwd) the emulator doesn't surface.
 			if cwd, ok := p.osc.scan(buf[:n]); ok && cwd != p.lastPwd {
 				p.lastPwd = cwd
@@ -258,39 +259,122 @@ func (h *Host) readPump(p *pane) {
 
 // detectPump probes the pane's foreground process group for agent identity and
 // runs the agent's detection manifest over the screen to classify state, emitting
-// a pane_agent event whenever the result changes. Identity is process-based; state
-// (idle/working/blocked) comes from the manifest rules on the screen + OSC title.
+// a pane_agent event whenever the debounced result changes. Identity is
+// process-based; state (idle/working/blocked) comes from the manifest rules on the
+// screen + OSC title.
+//
+// Stage C — driver parity: the raw per-tick classification is smoothed through the
+// detectstate.go state machine (ported from herdr) so transient flicker doesn't
+// reach the wire. Concretely: a newly-acquired agent is pinned to Idle for a
+// startup grace window; Working→plain-Idle drops are debounced over several fast
+// rechecks; an idle agent with no new output skips the screen scan entirely; and a
+// steady visible blocker is periodically re-emitted.
 func (h *Host) detectPump(p *pane) {
-	t := time.NewTicker(detectInterval)
-	defer t.Stop()
-	last := "\x00sentinel"
+	agent := ""
+	state := detect.StateUnknown
+	var lastVIdle, lastVBlocker, lastVWorking bool
+	var lastRefresh time.Time
+	var hasRefresh bool
+
+	var graceUntil time.Time
+	var graceActive bool
+
+	var lastScanSeq uint64
+	var hasLastScanSeq bool
+
+	var pending pendingIdle
+
 	for {
+		sleep := detectInterval
+		if pending.active() {
+			sleep = detectPendingIdleRecheck
+		}
+		timer := time.NewTimer(sleep)
 		select {
 		case <-h.done:
+			timer.Stop()
 			return
-		case <-t.C:
+		case <-timer.C:
 		}
 		if h.getPane(p.id) == nil {
 			return // pane closed/removed
 		}
-		agent := detect.ForegroundAgent(p.ptmx.Fd())
-		state := "unknown"
-		var vBlocker, vWorking bool
-		if agent != "" {
-			screen, title := h.paneScreenAndTitle(p)
-			d := detect.Detect(agent, detect.Input{Screen: screen, OscTitle: title})
-			if d.SkipStateUpdate {
-				continue // e.g. transcript viewer / model picker — keep last reported state
+		now := time.Now()
+
+		// Identity: re-probe the foreground process group every tick.
+		newAgent := detect.ForegroundAgent(p.ptmx.Fd())
+		if newAgent != agent {
+			agent = newAgent
+			pending.clear()
+			hasLastScanSeq = false
+			hasRefresh = false
+			lastVIdle, lastVBlocker, lastVWorking = false, false, false
+			if agent != "" {
+				// New agent acquired: publish Idle and hold for the startup grace
+				// window so startup paint doesn't register as Working.
+				graceUntil = now.Add(detectStartupGrace)
+				graceActive = true
+				state = detect.StateIdle
+				lastVIdle = true
+				h.emit(NewPaneAgent(p.id, agent, string(detect.StateIdle), false, false))
+			} else {
+				// Agent gone: report the pane back to a plain shell.
+				graceActive = false
+				state = detect.StateUnknown
+				h.emit(NewPaneAgent(p.id, "", string(detect.StateUnknown), false, false))
 			}
-			state = string(d.State)
-			vBlocker = d.VisibleBlocker
-			vWorking = d.VisibleWorking
+			continue
 		}
-		key := fmt.Sprintf("%s\x00%s\x00%t\x00%t", agent, state, vBlocker, vWorking)
-		if key != last {
-			last = key
-			h.emit(NewPaneAgent(p.id, agent, state, vBlocker, vWorking))
+
+		if agent == "" {
+			continue // plain shell: nothing to classify
 		}
+
+		// Startup grace: keep the held Idle until the window elapses.
+		if graceActive {
+			if now.Before(graceUntil) {
+				pending.clear()
+				continue
+			}
+			graceActive = false
+			hasLastScanSeq = false
+			pending.clear()
+			continue
+		}
+
+		// Content-skip: while idle with no new PTY bytes, skip the screen scan.
+		currentSeq := p.detectSeq.Load()
+		if shouldSkipIdleScreenScan(state, true, pending.active(), false, false, currentSeq, lastScanSeq, hasLastScanSeq) {
+			continue
+		}
+
+		screen, title := h.paneScreenAndTitle(p)
+		lastScanSeq = currentSeq
+		hasLastScanSeq = true
+
+		d := detect.Detect(agent, detect.Input{Screen: screen, OscTitle: title})
+		if d.SkipStateUpdate {
+			pending.clear()
+			continue // e.g. transcript viewer / model picker — keep last reported state
+		}
+
+		prev := publishState{state: state, visibleIdle: lastVIdle, visibleBlocker: lastVBlocker, visibleWorking: lastVWorking}
+		next := publishState{state: d.State, visibleIdle: d.VisibleIdle, visibleBlocker: d.VisibleBlocker, visibleWorking: d.VisibleWorking}
+
+		refreshDue := stableVisibleSignalRefreshDue(prev, next, lastRefresh, hasRefresh, now)
+		if !decideDetectionTransition(prev, next, false, false, refreshDue, now, &pending) {
+			continue
+		}
+
+		state = next.state
+		lastVIdle, lastVBlocker, lastVWorking = next.visibleIdle, next.visibleBlocker, next.visibleWorking
+		if next.visibleBlocker || next.visibleWorking {
+			lastRefresh = now
+			hasRefresh = true
+		} else {
+			hasRefresh = false
+		}
+		h.emit(NewPaneAgent(p.id, agent, string(next.state), next.visibleBlocker, next.visibleWorking))
 	}
 }
 

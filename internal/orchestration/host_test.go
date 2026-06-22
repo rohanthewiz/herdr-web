@@ -177,8 +177,10 @@ func TestHostReportsAgentWorkingState(t *testing.T) {
 	cp := NewCreatePane(5, 40, 5)
 	cp.Command = "/bin/sh"
 	// A foreground process named "pi" (agent) that prints the pi manifest's
-	// working marker — exercises identity + manifest state classification.
-	cp.Args = []string{"-c", `exec -a pi sh -c 'printf "Working..."; sleep 3'`}
+	// working marker — exercises identity + manifest state classification. It must
+	// outlive the Stage C startup grace window (3s), during which the screen is not
+	// yet scanned, so it sleeps comfortably past it.
+	cp.Args = []string{"-c", `exec -a pi sh -c 'printf "Working..."; sleep 8'`}
 	if err := WriteMessage(c, cp); err != nil {
 		t.Fatalf("create_pane: %v", err)
 	}
