@@ -318,6 +318,60 @@ func TestHostReportsHyperlinkFrame(t *testing.T) {
 	t.Fatal("never received a pane_frame carrying a hyperlink")
 }
 
+func TestHostScrollbackReportsMetrics(t *testing.T) {
+	c := startTestHost(t)
+
+	cp := NewCreatePane(9, 20, 3) // 3 rows ⇒ output quickly fills scrollback
+	cp.Command = "/bin/sh"
+	// Print 30 numbered lines (most scroll into history), then linger.
+	cp.Args = []string{"-c", `for i in $(seq 1 30); do printf "line%d\r\n" "$i"; done; sleep 1`}
+	if err := WriteMessage(c, cp); err != nil {
+		t.Fatalf("create_pane: %v", err)
+	}
+
+	// Wait for a frame reporting scrollback history, then scroll up into it.
+	deadline := time.Now().Add(10 * time.Second)
+	scrolled := false
+	for time.Now().Before(deadline) {
+		typ, payload := readEvent(t, c)
+		switch typ {
+		case MsgPaneFrame:
+			var pf PaneFrame
+			if err := json.Unmarshal(payload, &pf); err != nil {
+				t.Fatalf("decode pane_frame: %v", err)
+			}
+			if pf.PaneID != 9 || pf.Frame == nil || pf.Frame.Scroll == nil {
+				continue
+			}
+			s := pf.Frame.Scroll
+			if s.ViewportRows != 3 {
+				t.Fatalf("viewport_rows = %d, want 3", s.ViewportRows)
+			}
+			if s.MaxOffsetFromBottom == 0 {
+				t.Fatalf("expected scrollback history, got max offset 0")
+			}
+			if !scrolled {
+				// First metrics-bearing frame: we're at the bottom. Scroll up.
+				if s.OffsetFromBottom != 0 {
+					t.Fatalf("expected offset 0 at bottom, got %d", s.OffsetFromBottom)
+				}
+				scrolled = true
+				if err := WriteMessage(c, NewScrollViewport(9, -5)); err != nil {
+					t.Fatalf("scroll_viewport: %v", err)
+				}
+				continue
+			}
+			// After scrolling up, a frame should report a non-zero offset.
+			if s.OffsetFromBottom > 0 {
+				return
+			}
+		case MsgError:
+			t.Fatalf("unexpected error event: %s", string(payload))
+		}
+	}
+	t.Fatal("never observed a scrolled-up frame with non-zero offset")
+}
+
 func TestHostInputEchoAndClose(t *testing.T) {
 	c := startTestHost(t)
 

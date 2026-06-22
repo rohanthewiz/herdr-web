@@ -20,10 +20,21 @@ import (
 const (
 	defaultCellWidthPx  = 8
 	defaultCellHeightPx = 16
+
+	// defaultMaxScrollback is the history depth (lines) kept per termhost pane.
+	// libghostty defaults to 0 (no scrollback), so the Host must opt in for the
+	// orchestrator's scrollback to work.
+	defaultMaxScrollback = 10000
 )
 
 type ghosttyEmulator struct {
 	term *libghostty.Terminal
+
+	// scrollOffset is the viewport's distance (lines) above the live bottom; 0 =
+	// pinned to the bottom. libghostty exposes no current-offset query, so we track
+	// it ourselves (as herdr's Rust side does) and keep it in sync with Scroll and
+	// with new output (which snaps the viewport back to the bottom).
+	scrollOffset int
 
 	// Reusable render-state scratch, to avoid per-snapshot allocation.
 	rs *libghostty.RenderState
@@ -49,7 +60,10 @@ func WithWritePTY(fn func(data []byte)) Option {
 
 // New creates a go-libghostty-backed Emulator of the given cell dimensions.
 func New(cols, rows uint16, opts ...Option) (Emulator, error) {
-	topts := []libghostty.TerminalOption{libghostty.WithSize(cols, rows)}
+	topts := []libghostty.TerminalOption{
+		libghostty.WithSize(cols, rows),
+		libghostty.WithMaxScrollback(defaultMaxScrollback),
+	}
 	for _, o := range opts {
 		o(&topts)
 	}
@@ -81,8 +95,59 @@ func New(cols, rows uint16, opts ...Option) (Emulator, error) {
 }
 
 // Write feeds raw VT bytes through the parser. It always consumes all bytes.
+// New output snaps the viewport back to the live bottom (no scroll-lock yet —
+// pinning the view during streaming output is a follow-up).
 func (e *ghosttyEmulator) Write(p []byte) (int, error) {
-	return e.term.Write(p)
+	n, err := e.term.Write(p)
+	if n > 0 && e.scrollOffset != 0 {
+		e.term.ScrollViewportBottom()
+		e.scrollOffset = 0
+	}
+	return n, err
+}
+
+// Scroll moves the viewport by delta lines (negative = up into history), clamped
+// to the available scrollback, and tracks the resulting offset-from-bottom.
+func (e *ghosttyEmulator) Scroll(delta int) error {
+	max, err := e.term.ScrollbackRows()
+	if err != nil {
+		return fmt.Errorf("terminal: scrollback rows: %w", err)
+	}
+	target := e.scrollOffset - delta // delta<0 (up) raises the offset
+	if target < 0 {
+		target = 0
+	}
+	if target > int(max) {
+		target = int(max)
+	}
+	// ScrollViewportDelta: up is negative. Moving offset cur→target needs a delta
+	// of (cur-target): negative when target>cur (scrolling up), positive otherwise.
+	if move := e.scrollOffset - target; move != 0 {
+		e.term.ScrollViewportDelta(move)
+	}
+	e.scrollOffset = target
+	return nil
+}
+
+// ScrollMetrics reports the current scrollback position.
+func (e *ghosttyEmulator) ScrollMetrics() (ScrollMetrics, error) {
+	max, err := e.term.ScrollbackRows()
+	if err != nil {
+		return ScrollMetrics{}, fmt.Errorf("terminal: scrollback rows: %w", err)
+	}
+	rows, err := e.term.Rows()
+	if err != nil {
+		return ScrollMetrics{}, fmt.Errorf("terminal: rows: %w", err)
+	}
+	off := e.scrollOffset
+	if off > int(max) { // history was pruned below our tracked offset
+		off = int(max)
+	}
+	return ScrollMetrics{
+		OffsetFromBottom:    off,
+		MaxOffsetFromBottom: int(max),
+		ViewportRows:        int(rows),
+	}, nil
 }
 
 func (e *ghosttyEmulator) Resize(cols, rows uint16) error {
@@ -127,6 +192,9 @@ func (e *ghosttyEmulator) Snapshot() (*Snapshot, error) {
 		DefaultFg: toColor(colors.Foreground),
 		DefaultBg: toColor(colors.Background),
 		Cells:     make([][]Cell, 0, rows),
+	}
+	if sm, err := e.ScrollMetrics(); err == nil {
+		snap.Scroll = sm
 	}
 
 	if err := e.rs.RowIterator(e.ri); err != nil {
@@ -194,13 +262,13 @@ func (e *ghosttyEmulator) cursor() (Cursor, error) {
 	if err != nil {
 		return Cursor{}, fmt.Errorf("terminal: cursor visible: %w", err)
 	}
-	x, err := e.rs.CursorViewportX()
-	if err != nil {
-		return Cursor{}, fmt.Errorf("terminal: cursor x: %w", err)
-	}
-	y, err := e.rs.CursorViewportY()
-	if err != nil {
-		return Cursor{}, fmt.Errorf("terminal: cursor y: %w", err)
+	// When the viewport is scrolled into history the cursor lies outside it, and
+	// libghostty reports its viewport position as invalid; treat that as a hidden
+	// cursor rather than failing the whole snapshot.
+	x, errX := e.rs.CursorViewportX()
+	y, errY := e.rs.CursorViewportY()
+	if errX != nil || errY != nil {
+		return Cursor{Visible: false}, nil
 	}
 	vs, err := e.rs.CursorVisualStyle()
 	if err != nil {

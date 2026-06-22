@@ -31,11 +31,12 @@ type MessageType string
 
 const (
 	// Rust → Go (commands).
-	MsgHello      MessageType = "hello"
-	MsgCreatePane MessageType = "create_pane"
-	MsgInput      MessageType = "input"
-	MsgResize     MessageType = "resize"
-	MsgClosePane  MessageType = "close_pane"
+	MsgHello          MessageType = "hello"
+	MsgCreatePane     MessageType = "create_pane"
+	MsgInput          MessageType = "input"
+	MsgResize         MessageType = "resize"
+	MsgClosePane      MessageType = "close_pane"
+	MsgScrollViewport MessageType = "scroll_viewport"
 
 	// Go → Rust (events).
 	MsgWelcome       MessageType = "welcome"
@@ -104,6 +105,20 @@ type ClosePane struct {
 }
 
 func NewClosePane(id uint32) ClosePane { return ClosePane{Type: MsgClosePane, PaneID: id} }
+
+// ScrollViewport scrolls a pane's viewport by Delta lines: negative scrolls up
+// into scrollback history, positive scrolls back down toward the live bottom. The
+// Go side clamps to the available history, so a large positive Delta is a reliable
+// "scroll to bottom". The resulting position is reported back via Frame.Scroll.
+type ScrollViewport struct {
+	Type   MessageType `json:"type"`
+	PaneID uint32      `json:"pane_id"`
+	Delta  int32       `json:"delta"`
+}
+
+func NewScrollViewport(id uint32, delta int32) ScrollViewport {
+	return ScrollViewport{Type: MsgScrollViewport, PaneID: id, Delta: delta}
+}
 
 // --- Events (Go → Rust) -----------------------------------------------------
 
@@ -245,6 +260,16 @@ type Frame struct {
 	// Hyperlinks is the frame's OSC 8 URI table; a cell's Hyperlink indexes into it.
 	// Only populated on frames that carry links (which are always sent full).
 	Hyperlinks []string `json:"hyperlinks,omitempty"`
+	// Scroll is the pane's scrollback position, present only when the pane has
+	// scrollback history (so non-scrollback panes' frames are unchanged).
+	Scroll *ScrollInfo `json:"scroll,omitempty"`
+}
+
+// ScrollInfo mirrors terminal.ScrollMetrics on the wire (and herdr's ScrollMetrics).
+type ScrollInfo struct {
+	OffsetFromBottom    int `json:"offset_from_bottom"`
+	MaxOffsetFromBottom int `json:"max_offset_from_bottom"`
+	ViewportRows        int `json:"viewport_rows"`
 }
 
 // ratatui Modifier bits (subset we map).
@@ -367,6 +392,15 @@ func FrameFromSnapshot(cur, prev *terminal.Snapshot) *Frame {
 				cell.Hyperlink = &i
 			}
 			f.Cells = append(f.Cells, cell)
+		}
+	}
+	// Carry scrollback position only when the pane has history (or is scrolled),
+	// leaving non-scrollback panes' frames byte-for-byte as before.
+	if cur.Scroll.MaxOffsetFromBottom > 0 || cur.Scroll.OffsetFromBottom > 0 {
+		f.Scroll = &ScrollInfo{
+			OffsetFromBottom:    cur.Scroll.OffsetFromBottom,
+			MaxOffsetFromBottom: cur.Scroll.MaxOffsetFromBottom,
+			ViewportRows:        cur.Scroll.ViewportRows,
 		}
 	}
 	return f

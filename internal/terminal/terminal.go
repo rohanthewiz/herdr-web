@@ -68,6 +68,21 @@ type Snapshot struct {
 	// HasHyperlinks is true when at least one cell carries an OSC 8 Link, letting
 	// the frame builder skip the per-cell link scan when there are none.
 	HasHyperlinks bool
+
+	// Scroll is the scrollback position at snapshot time.
+	Scroll ScrollMetrics
+}
+
+// ScrollMetrics describes a pane's scrollback position, mirroring herdr's
+// ScrollMetrics so the orchestrator can drive its scrollbar/indicator.
+type ScrollMetrics struct {
+	// OffsetFromBottom is how many lines the viewport is scrolled up from the
+	// live bottom (0 = pinned to the bottom / active area).
+	OffsetFromBottom int
+	// MaxOffsetFromBottom is the number of scrollback (history) lines available.
+	MaxOffsetFromBottom int
+	// ViewportRows is the visible grid height in cells.
+	ViewportRows int
 }
 
 // At returns the cell at (col,row), or the zero Cell if out of range.
@@ -94,6 +109,14 @@ type Emulator interface {
 
 	// Title returns the window/icon title set via OSC 0/2, or "" if none.
 	Title() (string, error)
+
+	// Scroll moves the viewport by delta lines: negative scrolls up into history,
+	// positive scrolls back down toward the live bottom. The viewport is clamped
+	// to the available scrollback.
+	Scroll(delta int) error
+
+	// ScrollMetrics reports the current scrollback position.
+	ScrollMetrics() (ScrollMetrics, error)
 
 	// Close releases the underlying terminal resources.
 	Close() error

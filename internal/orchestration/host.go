@@ -197,6 +197,15 @@ func (h *Host) dispatch(typ MessageType, payload []byte) {
 		if p := h.removePane(c.PaneID); p != nil {
 			h.closePane(p) // read pump observes EOF and emits pane_exited
 		}
+	case MsgScrollViewport:
+		var c ScrollViewport
+		if err := json.Unmarshal(payload, &c); err != nil {
+			h.emit(NewError(0, "bad scroll_viewport: "+err.Error()))
+			return
+		}
+		if err := h.scrollPane(c); err != nil {
+			h.emit(NewError(c.PaneID, err.Error()))
+		}
 	default:
 		h.emit(NewError(0, "unknown message type: "+string(typ)))
 	}
@@ -529,6 +538,23 @@ func (h *Host) resizePane(c Resize) error {
 		return fmt.Errorf("emulator resize: %w", err)
 	}
 	p.dirty.Store(true) // dimensions changed ⇒ next frame is full
+	return nil
+}
+
+func (h *Host) scrollPane(c ScrollViewport) error {
+	p := h.getPane(c.PaneID)
+	if p == nil {
+		return errors.New("no such pane")
+	}
+	p.emuMu.Lock()
+	defer p.emuMu.Unlock()
+	if p.closed {
+		return nil
+	}
+	if err := p.emu.Scroll(int(c.Delta)); err != nil {
+		return fmt.Errorf("scroll: %w", err)
+	}
+	p.dirty.Store(true) // viewport moved ⇒ emit a frame at the new position
 	return nil
 }
 
