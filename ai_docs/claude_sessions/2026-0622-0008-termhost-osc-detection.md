@@ -144,13 +144,31 @@ channel so the Rust emulator can eventually be dropped.
 - Tests: `osc52_test.go` (12 pure cases ported from herdr's forwarder suite) + Host integration
   `TestHostReportsPaneClipboard` (child `printf`s OSC 52 → `pane_clipboard` data="hello").
 
+### 7. OSC 9 progress wired into detection — commit `5c18aa5`
+- **`internal/orchestration/osc9.go`** (new, **pure / no ghostty tag**) — `osc9Scanner` raw-scans
+  OSC 9 from the PTY stream (libghostty surfaces OSC 0/2 title via `Title()` but **not** OSC 9),
+  mirroring the OSC 7 scanner + the OSC 9 half of herdr's `AgentOscStateTracker`.
+  - `parseOSC9Progress` returns the payload after `9;` (e.g. `4;3;`), sanitized via
+    `sanitizeOSCString` (strip control chars, cap 256 runes — mirrors `AGENT_OSC_MAX_CHARS`).
+  - `scan` returns the most-recent progress in the chunk (latest-retained), 4 KiB cap + recovery.
+- **`host.go`**: `pane.osc9` (readPump-owned) + **`pane.progress atomic.Pointer[string]`** (shared
+  latest; readPump writes, detectPump reads, `nil`=none). `detectPump` now passes
+  `detect.Input.OscProgress` (was hardcoded `""`) and **clears progress on agent change** (mirrors
+  Rust's `clear_retained`) so a new agent can't inherit the previous process's progress.
+- Tests: `osc9_test.go` (9 pure cases — BEL/ST/empty, ignore-other, split, latest-wins, control
+  strip, length cap, overlong-abandon+recover).
+- **No distinctive e2e observable today:** claude is the only manifest with an `osc_progress` rule
+  (`^4;0`→idle, no visible flag, prio 250) — same result as its idle fallback. So this is **parity +
+  future-proofing**; the testable surface is the scanner (covered). No host integration test added
+  (nothing the idle fallback doesn't already produce).
+
 ---
 
 ## Key facts for future me
 
-- **go-libghostty gaps:** OSC 7 (pwd) and OSC 52 (clipboard) are NOT exposed; scan raw
-  bytes (`oscScanner`). OSC 0/2 title IS exposed (`Title()`). OSC 9 progress: not checked
-  yet — pass "" for now (some Claude rules want it).
+- **go-libghostty gaps:** OSC 7 (pwd), OSC 52 (clipboard), and OSC 9 (progress) are NOT exposed;
+  scan raw bytes (`oscScanner` / `osc52Scanner` / `osc9Scanner`). OSC 0/2 title IS exposed
+  (`Title()`). OSC 9 progress is now scanned and fed to `detect.Input.OscProgress`.
 - **detect pkg is plain cgo (libproc), not ghostty-tagged** → compiles in default builds.
   The orchestration Host that uses it is `//go:build ghostty`.
 - **Agent label == manifest `id`.** Detection: process → identity (label); manifest →
@@ -173,13 +191,14 @@ channel so the Rust emulator can eventually be dropped.
 - Default `go build ./...` (cgo on); `-tags ghostty` build.
 - `go test ./internal/detect/` (pure, no toolchain): identify, manifest engine, all-compile.
 - `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce (8) +
-  `detectthrottle` (8) + `osc` (OSC 7) + `osc52` (OSC 52, 12) scanners.
+  `detectthrottle` (8) + `osc` (OSC 7) + `osc52` (OSC 52, 12) + `osc9` (OSC 9, 9) scanners.
 - `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working + terminal + orchestration.
 - gofmt/vet clean in both default and `-tags ghostty` modes.
 
 ## Commits on `roh/phase-b` (this session)
 
 ```
+5c18aa5 feat: OSC 9 progress wired into detection (Go side)
 c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
 5c6da0d feat: Stage C.2 — process-probe throttle (Go side)
 2207526 feat: Stage C — driver-parity detection debounce (Go side)
@@ -191,11 +210,9 @@ c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
 
 ## Next steps
 
-- **OSC 9 progress:** raw-scan OSC 9 (+ OSC 0/2 title is already surfaced) for richer Claude
-  idle/working rules. The detector currently passes `OscProgress: ""` — wire a progress scanner
-  (same `osc52Scanner`-style template) into `detectPump`'s `detect.Input`.
-- **Rust consumer for `pane_clipboard`:** the Go seam now emits it; the Rust side must map it onto
-  `AppEvent::ClipboardWrite` so the orchestrator's clipboard writer re-emits it.
+- **Rust consumers for the new seam events:** the Go seam now emits `pane_clipboard` (OSC 52); the
+  Rust side must map it onto `AppEvent::ClipboardWrite` so the orchestrator's clipboard writer
+  re-emits it. (OSC 9 progress is consumed Go-side already, inside detection — no new seam event.)
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
   manual `HERDR_TERMHOST_SOCKET` env + hand launch.
 - Eventually: make termhost the default and **retire the Rust in-process detector/PTY path**.
