@@ -210,9 +210,9 @@ c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
 
 ## Next steps
 
-- **Rust consumers for the new seam events:** the Go seam now emits `pane_clipboard` (OSC 52); the
-  Rust side must map it onto `AppEvent::ClipboardWrite` so the orchestrator's clipboard writer
-  re-emits it. (OSC 9 progress is consumed Go-side already, inside detection — no new seam event.)
+- **Rust consumer for `pane_clipboard`:** ✅ done in herdr `5ce148a` (`Event::PaneClipboard` →
+  `PaneSignal::Clipboard` → `AppEvent::ClipboardWrite`). (OSC 9 progress is consumed Go-side
+  already, inside detection — no new seam event.)
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
   manual `HERDR_TERMHOST_SOCKET` env + hand launch.
 - Eventually: make termhost the default and **retire the Rust in-process detector/PTY path**.
