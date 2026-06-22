@@ -96,10 +96,36 @@ channel so the Rust emulator can eventually be dropped.
 - Tests: `detectstate_test.go` (8 pure cases — hold/cap/bypass, skip-scan, publish, refresh,
   composed transition). `pi` working-state fixture bumped to `sleep 8` so it outlives the grace;
   `TestHostReportsAgentWorkingState` now takes ~3.6s (direct evidence the grace gates the scan).
-- **Partial parity:** the heavy process-probe throttle (5s/30s rechecks, acquisition windows,
-  agent-presence consecutive-miss handling) is NOT ported — we still probe the foreground agent
-  every base tick. Only the pending-idle 100ms recheck cadence was ported. Follow-up if idle-pane
-  syscall cost matters.
+- **Partial parity (now closed — see Stage C.2):** the heavy process-probe throttle was deferred
+  here; it shipped in `5c6da0d`.
+
+### 5. Agent detection — Stage C.2: process-probe throttle — commit `5c6da0d`
+- **`detect.ForegroundPGID(fd) int`** (new, all 3 procscan platforms): the cheap probe — a single
+  `tcgetpgrp` (`-1` == no group). Gates the expensive `ForegroundAgent` enumeration so an idle pane
+  costs ~one syscall per tick instead of a full per-pid comm/path/argv sweep.
+- **`internal/orchestration/detectthrottle.go`** (new, **pure / no ghostty tag**) — port of herdr's
+  `src/pane.rs` throttle (`should_probe_foreground_job` + `AgentDetectionPresence`):
+  - **`agentPresence`**: identity debounce. Adopts a non-empty probe immediately; an identified
+    agent survives transient misses and only clears after **6 consecutive** empty probes
+    (`AGENT_MISS_CONFIRMATION_ATTEMPTS`). A hit resets the miss counter (misses must be consecutive).
+  - **`shouldProbeForegroundJob`**: full enumeration runs only on process-group change, the **5s**
+    identified recheck, the **30s** missing-foreground-group recheck, or inside a post-group-change
+    **acquisition window** (500ms for the first 1.5s, then 2s, up to an 8s cap) to catch a
+    still-starting agent (argv settles a beat after the group appears — agents run under `node`).
+  - **`foregroundGroupChanged`**: `noPGID (-1)` treated as a real absent value (appear/vanish count).
+- **`host.go` `detectPump`**: cheap pgid each tick → throttle decision → enumerate only when due →
+  fold through `agentPresence`. Acquisition window opens on an unidentified group change
+  (`hadProcessProbe && groupChanged`), clears on identify or after the 8s cap.
+- **Scope (documented in `detectthrottle.go`):** no-suppression / no-lifecycle-authority **subset**.
+  Omitted `sync_content_change_acquisition` (the content-driven acquisition path); the realistic
+  agent-launch case still opens an acquisition window because launching an agent makes a new process
+  group while the shell was already being probed. Suppressed-agent (remote release), foreground-shell
+  exit reporting, and full-lifecycle-authority inputs are not ported (those subsystems don't exist
+  on the Go backend yet).
+- Tests: `detectthrottle_test.go` (8 pure cases — presence adopt/switch, miss-tolerance,
+  consecutive-only misses, clear, group-changed, identified/unidentified recheck, acquisition
+  fast/slow/expired). Existing Host integration tests still pass through the throttled pump
+  (`exec -a codex` identified on first probe; `pi` working after the 3s grace).
 
 ---
 
@@ -115,6 +141,10 @@ channel so the Rust emulator can eventually be dropped.
 - **Detection publishing is debounced (Stage C), not raw.** `detectstate.go` is the pure,
   unit-testable parity port; `detectPump` drives it. Startup grace (3s) means a fresh agent
   reads Idle for ~3s before its first real scan — tests/fixtures must outlive that window.
+- **Identity is throttled (Stage C.2), not per-tick.** `detectthrottle.go` gates the expensive
+  `ForegroundAgent` enumeration behind a cheap `ForegroundPGID` (tcgetpgrp). An idle pane probes
+  identity rarely (5s recheck) but the loop still ticks at 300ms for screen scans. `agentPresence`
+  needs 6 consecutive misses to drop an agent — so a one-off probe miss never flaps identity.
 - **Build/run env:**
   - Rust: `export ZIG="~/projs/go/herdr-web/.tools/zig-wrapped"`
   - Go (ghostty): `export PKG_CONFIG_PATH=~/projs/rust/herdr/vendor/libghostty-vt/zig-out/share/pkgconfig`
@@ -125,13 +155,15 @@ channel so the Rust emulator can eventually be dropped.
 
 - Default `go build ./...` (cgo on); `-tags ghostty` build.
 - `go test ./internal/detect/` (pure, no toolchain): identify, manifest engine, all-compile.
-- `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce machine (8 cases).
+- `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce (8) +
+  `detectthrottle` (8) machines.
 - `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working + terminal + orchestration.
 - gofmt/vet clean in both default and `-tags ghostty` modes.
 
 ## Commits on `roh/phase-b` (this session)
 
 ```
+5c6da0d feat: Stage C.2 — process-probe throttle (Go side)
 2207526 feat: Stage C — driver-parity detection debounce (Go side)
 5b7e723 feat: manifest-driven agent state detection in Go (Stage B)
 156be75 feat: agent detection in Go — process identity (Stage A)
@@ -141,10 +173,6 @@ channel so the Rust emulator can eventually be dropped.
 
 ## Next steps
 
-- **Stage C — process-probe throttle (the un-ported remainder):** port herdr's foreground
-  process-group recheck cadences (5s identified / 30s missing-group), acquisition windows, and
-  agent-presence consecutive-miss handling. The debounce/grace/content-skip half shipped in
-  `2207526`; this half cuts idle-pane syscall churn (we currently probe every 300ms tick).
 - **OSC 52 clipboard:** extend `oscScanner` to OSC 52 (+ base64) → `pane_clipboard` event.
 - **OSC 9 progress:** raw-scan for richer Claude idle/working rules.
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
