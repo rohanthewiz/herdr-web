@@ -127,6 +127,23 @@ channel so the Rust emulator can eventually be dropped.
   fast/slow/expired). Existing Host integration tests still pass through the throttled pump
   (`exec -a codex` identified on first probe; `pi` working after the 3s grace).
 
+### 6. OSC 52 clipboard passthrough — commit `c2cb5f8`
+- **`internal/orchestration/osc52.go`** (new, **pure / no ghostty tag**) — a **separate**
+  `osc52Scanner` (the OSC 7 template from item 1), mirroring herdr's separate
+  `Osc52Forwarder` vs `CwdOscTracker`. Kept distinct from `oscScanner` because OSC 52 payloads
+  need a **256 KiB** cap (vs OSC 7's 4 KiB) and so the working OSC 7 path + its tests stay untouched.
+  - Same ESC/`]`/BEL/ST state machine, split-across-reads tolerant. **ESC mid-payload is pushed
+    back as literal bytes** (per Rust) so it just fails base64 rather than aborting the body.
+  - `parseOSC52Clipboard`: accepts `52;c;<b64>` and `52;;<b64>` (default selection); rejects other
+    selections (`p/q/s/0-7`), queries (`?` — no reply path here), and non-standard-base64. `52;c;`
+    (empty payload) decodes to an empty slice = **clipboard-clear**. 256 KiB cap, bounded per byte.
+- **`protocol.go`**: `MsgPaneClipboard` + `PaneClipboard{pane_id, data}` + `NewPaneClipboard`.
+  `Data []byte` → base64 on the JSON wire (like `Input.Data`); empty Data == clear.
+- **`host.go`**: `pane.osc52 osc52Scanner`; `readPump` feeds each read and emits **one
+  `pane_clipboard` per write** (no dedup — every write forwarded, matching Rust's drain-all).
+- Tests: `osc52_test.go` (12 pure cases ported from herdr's forwarder suite) + Host integration
+  `TestHostReportsPaneClipboard` (child `printf`s OSC 52 → `pane_clipboard` data="hello").
+
 ---
 
 ## Key facts for future me
@@ -149,20 +166,21 @@ channel so the Rust emulator can eventually be dropped.
   - Rust: `export ZIG="~/projs/go/herdr-web/.tools/zig-wrapped"`
   - Go (ghostty): `export PKG_CONFIG_PATH=~/projs/rust/herdr/vendor/libghostty-vt/zig-out/share/pkgconfig`
   - Daemon: `go build -tags ghostty -o /tmp/td ./cmd/termhost && /tmp/td --socket /tmp/x.sock`
-- **Seam events now (Go→Rust):** `welcome`, `pane_frame`, `pane_cwd`, `pane_agent`, `pane_exited`, `error`.
+- **Seam events now (Go→Rust):** `welcome`, `pane_frame`, `pane_cwd`, `pane_agent`, `pane_clipboard`, `pane_exited`, `error`.
 
 ## Verification (all green)
 
 - Default `go build ./...` (cgo on); `-tags ghostty` build.
 - `go test ./internal/detect/` (pure, no toolchain): identify, manifest engine, all-compile.
 - `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce (8) +
-  `detectthrottle` (8) machines.
+  `detectthrottle` (8) + `osc` (OSC 7) + `osc52` (OSC 52, 12) scanners.
 - `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working + terminal + orchestration.
 - gofmt/vet clean in both default and `-tags ghostty` modes.
 
 ## Commits on `roh/phase-b` (this session)
 
 ```
+c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
 5c6da0d feat: Stage C.2 — process-probe throttle (Go side)
 2207526 feat: Stage C — driver-parity detection debounce (Go side)
 5b7e723 feat: manifest-driven agent state detection in Go (Stage B)
@@ -173,8 +191,11 @@ channel so the Rust emulator can eventually be dropped.
 
 ## Next steps
 
-- **OSC 52 clipboard:** extend `oscScanner` to OSC 52 (+ base64) → `pane_clipboard` event.
-- **OSC 9 progress:** raw-scan for richer Claude idle/working rules.
+- **OSC 9 progress:** raw-scan OSC 9 (+ OSC 0/2 title is already surfaced) for richer Claude
+  idle/working rules. The detector currently passes `OscProgress: ""` — wire a progress scanner
+  (same `osc52Scanner`-style template) into `detectPump`'s `detect.Input`.
+- **Rust consumer for `pane_clipboard`:** the Go seam now emits it; the Rust side must map it onto
+  `AppEvent::ClipboardWrite` so the orchestrator's clipboard writer re-emits it.
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
   manual `HERDR_TERMHOST_SOCKET` env + hand launch.
 - Eventually: make termhost the default and **retire the Rust in-process detector/PTY path**.
