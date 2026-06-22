@@ -200,13 +200,39 @@ channel so the Rust emulator can eventually be dropped.
   clickable links). The native-TUI mouse resolver `visible_hyperlinks` still reads the *unfed* local
   emulator for termhost panes → TUI click-to-open won't see them yet (separate consumer; follow-up).
 
+### 10. Scrollback passthrough — commit `3fc51c5` (Rust consumer: herdr `048875f`)
+- **Different shape again:** not an OSC scan — needs a **command** (Rust→Go) + scrollback rendering
+  + position metrics. Both `Terminal.ScrollViewport{Top,Bottom,Delta}` and `ScrollbackRows()` exist
+  in the Go binding. **Gotcha found:** the Go emulator created terminals with libghostty's default
+  **0** scrollback — termhost panes had no history at all until `WithMaxScrollback`.
+- **`internal/terminal`**: `Emulator.Scroll(delta)` + `ScrollMetrics()`; `Snapshot.Scroll`. ghostty
+  impl tracks `scrollOffset` itself (no current-offset query in the binding), clamps to
+  `ScrollbackRows()`, and **snaps to bottom on new output** (no scroll-lock yet — follow-up). Also:
+  `cursor()` now tolerates the cursor scrolled off-viewport (libghostty reports its viewport pos as
+  invalid) → return hidden cursor instead of failing the whole snapshot.
+- **`protocol.go`**: `ScrollViewport { pane_id, delta }` command (negative=up, positive=down; Go
+  clamps so a big positive delta = scroll-to-bottom). `Frame.Scroll` (`ScrollInfo`:
+  offset/max_offset/viewport_rows), present **only when the pane has history** so non-scrollback
+  frames are byte-for-byte unchanged.
+- **`host.go`**: `scrollPane` applies `emu.Scroll` under `emuMu` + marks dirty → next frame renders
+  the scrolled viewport with metrics.
+- **Rust consumer** (`048875f`): `Command::ScrollViewport` + `proto::Frame.scroll`;
+  `PaneGrid.scroll` retained through `apply`; `TermhostPane.scroll/scroll_metrics`; and
+  **`PaneRuntime`'s scroll_up/down/reset/set_offset/scroll_metrics now branch to the termhost
+  backend** (mapping to/from the seam delta) instead of the unfed emulator.
+- Tests: terminal `TestScrollback` (empirical: history → scroll-to-top shows L1 → clamp → snap on
+  output) + host `TestHostScrollbackReportsMetrics`; Rust proto command-serialize + frame-scroll
+  decode (+ default-none).
+
 ---
 
 ## Key facts for future me
 
 - **go-libghostty gaps:** OSC 7 (pwd), OSC 52 (clipboard), and OSC 9 (progress) are NOT exposed;
   scan raw bytes (`oscScanner` / `osc52Scanner` / `osc9Scanner`). OSC 0/2 title IS exposed
-  (`Title()`). OSC 9 progress is now scanned and fed to `detect.Input.OscProgress`.
+  (`Title()`). OSC 9 progress is now scanned and fed to `detect.Input.OscProgress`. **Scrollback
+  defaults to 0 (no history)** — `New` must pass `WithMaxScrollback`; libghostty has **no
+  current-offset query**, so the emulator tracks `scrollOffset` itself.
 - **detect pkg is plain cgo (libproc), not ghostty-tagged** → compiles in default builds.
   The orchestration Host that uses it is `//go:build ghostty`.
 - **Agent label == manifest `id`.** Detection: process → identity (label); manifest →
@@ -222,7 +248,8 @@ channel so the Rust emulator can eventually be dropped.
   - Rust: `export ZIG="~/projs/go/herdr-web/.tools/zig-wrapped"`
   - Go (ghostty): `export PKG_CONFIG_PATH=~/projs/rust/herdr/vendor/libghostty-vt/zig-out/share/pkgconfig`
   - Daemon: `go build -tags ghostty -o /tmp/td ./cmd/termhost && /tmp/td --socket /tmp/x.sock`
-- **Seam events now (Go→Rust):** `welcome`, `pane_frame`, `pane_cwd`, `pane_agent`, `pane_clipboard`, `pane_title`, `pane_exited`, `error`. (OSC 8 hyperlinks ride `pane_frame` — `Frame.Hyperlinks` table + per-cell index — not a new event.)
+- **Seam events now (Go→Rust):** `welcome`, `pane_frame`, `pane_cwd`, `pane_agent`, `pane_clipboard`, `pane_title`, `pane_exited`, `error`. (OSC 8 hyperlinks + scrollback metrics ride `pane_frame` — `Frame.Hyperlinks` table / `Frame.Scroll` — not new events.)
+- **Seam commands now (Rust→Go):** `hello`, `create_pane`, `input`, `resize`, `close_pane`, `scroll_viewport`.
 
 ## Verification (all green)
 
@@ -231,13 +258,14 @@ channel so the Rust emulator can eventually be dropped.
 - `go test ./internal/orchestration/` (pure, default build): `detectstate` debounce (8) +
   `detectthrottle` (8) + `osc` (OSC 7) + `osc52` (OSC 52, 12) + `osc9` (OSC 9, 9) +
   `osctitle` (OSC 0/2, 8) scanners + `FrameFromSnapshot` hyperlink table/no-link.
-- `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working/title/clipboard/hyperlink-frame
-  + terminal + orchestration.
+- `go test -tags ghostty ./internal/...`: Host cwd/agent/agent-working/title/clipboard/hyperlink-frame/
+  scrollback-metrics + terminal (incl. `TestScrollback`) + orchestration.
 - gofmt/vet clean in both default and `-tags ghostty` modes.
 
 ## Commits on `roh/phase-b` (this session)
 
 ```
+3fc51c5 feat: scrollback passthrough on the termhost seam (Go side)
 96bec8b feat: OSC 8 hyperlink passthrough on the termhost seam (Go side)
 6807bbb feat: OSC 0/2 window title passthrough on the termhost seam (Go side)
 5c18aa5 feat: OSC 9 progress wired into detection (Go side)
@@ -254,9 +282,13 @@ c2cb5f8 feat: OSC 52 clipboard passthrough on the termhost seam (Go side)
 
 - **`pane_clipboard` (OSC 52)** ✅ herdr `5ce148a`; **`pane_title` (OSC 0/2)** ✅ herdr `7f32edf`.
   (OSC 9 progress is consumed Go-side inside detection — no seam event.)
-- **Remaining termhost degradations:** scrollback, selection, kitty graphics — each needs a seam
-  carry + Rust consumer. (OSC 8 hyperlinks ✅ item 9, for the frame-data/web render path; the
-  native-TUI click resolver is a separate follow-up.)
+- **Selection (next):** decided model — Go request/response. `RequestSelection { pane_id, anchor,
+  cursor }` command → ghostty selection formatter → `pane_selection { text }` event →
+  `AppEvent::ClipboardWrite`. The scrollback metrics from item 10 are the foundation its absolute
+  (screen-buffer) coordinates need.
+- **Remaining termhost degradations:** kitty graphics. (OSC 8 hyperlinks ✅ item 9 for the web render
+  path; scrollback ✅ item 10.) Follow-ups: scroll-lock/pinning (output currently snaps to bottom);
+  native-TUI hyperlink click resolver.
 - **Daemon lifecycle:** have the Rust server spawn/supervise `cmd/termhost` instead of the
   manual `HERDR_TERMHOST_SOCKET` env + hand launch.
 - Eventually: make termhost the default and **retire the Rust in-process detector/PTY path**.
