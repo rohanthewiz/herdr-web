@@ -45,24 +45,35 @@ handling; Go owns the fed emulator that can resolve coordinates to text.
   `TestHostReportsPaneSelection` (child prints `HELLO WORLD`, request screen cols
   0..4 inclusive → `pane_selection` text `"HELLO"`).
 
-### Rust side — commit herdr `ef489d3` (consumer)
-The selection reply rides the **same async signal path** OSC 52 clipboard already
-uses (`PaneSignal::Clipboard` → `AppEvent::ClipboardWrite`), so no blocking on the
-UI thread — important because `extract_selection` is a synchronous `&self` call but
-the seam is async.
-- **`proto.rs`**: `Command::RequestSelection {…}` + `SelectionPoint { row, col }`
-  (`rectangle` `skip_serializing_if` when false, matching Go's `omitempty`) and
-  `Event::PaneSelection { pane_id, text }`. 5 new tests.
-- **`client.rs`**: `PaneSignal::Selection(String)`; handle the `pane_selection`
-  event into the pane's sink; `TermhostPane::request_selection(...)` sends the cmd.
-- **`pane.rs`**: the signal sink turns `PaneSignal::Selection(text)` into the same
-  `AppEvent::ClipboardWrite { content: text.into_bytes() }` the in-process drag-copy
-  produces (skips empty). `PaneRuntime::request_termhost_selection(sel)` reads
-  `sel.ordered_cells()` and fires the request; returns `false` for in-process panes.
-- **`terminal/runtime.rs`**: delegate `request_termhost_selection` (the call site
-  uses the `TerminalRuntime` wrapper, not `PaneRuntime` — the one compile fix).
-- **`app/actions.rs`** `copy_selection`: try `request_termhost_selection` first
-  (async reply → clipboard); in-process panes fall back to synchronous extract+copy.
+### Rust side — herdr `ef489d3` (consumer) then `e3ae3d2` (synchronous rework)
+**Proto/wire (`ef489d3`, kept):** `Command::RequestSelection {…}` +
+`SelectionPoint { row, col }` (`rectangle` `skip_serializing_if` when false,
+matching Go's `omitempty`) and `Event::PaneSelection { pane_id, text }`. 5 proto
+tests.
+
+**Design (final, `e3ae3d2`): one synchronous mechanism for every selection path.**
+The first cut (`ef489d3`) made drag-copy async — the reply rode the OSC 52 clipboard
+signal path (`PaneSignal::Selection` → `AppEvent::ClipboardWrite`), no UI-thread
+block. But double-click word copy (`copy_word_at_pane_cell`) and URL-at-cell
+(`url_at_pane_cell`) read a row's text **inline** to compute word/URL bounds — they
+need the value back, not fire-and-forget. So drag-copy's async path was reworked
+into a single **blocking** request/response that serves all paths through the
+existing `extract_selection` call sites (no per-site branching):
+- **`client.rs`**: `PaneState.pending_selection` one-shot slot (`mpsc::Sender`); the
+  reader thread routes a `pane_selection` reply to the waiter (take-on-deliver, so a
+  late/duplicate reply is dropped). `TermhostPane::extract_selection_blocking(...)`
+  registers the waiter, sends the command, and blocks on `recv_timeout` (**1s** cap
+  guards a wedged daemon). `PaneSignal::Selection` removed.
+- **`pane.rs`**: `PaneRuntime::extract_selection` branches — for a termhost pane it
+  calls `extract_selection_blocking(sel.ordered_cells())`; in-process panes read the
+  local emulator as before. The `PaneSignal::Selection` sink arm is gone.
+- **`terminal/runtime.rs`**: no new delegate needed (the `TerminalRuntime` wrapper
+  already forwards `extract_selection`).
+- **`app/actions.rs`**: `copy_selection` is the plain synchronous extract+copy —
+  unchanged shape; it now just works for termhost panes via the branch above.
+- Test: `client.rs` unit test drives the full round-trip over a **real Unix socket**
+  with a fake daemon thread (Hello→Welcome, CreatePane, RequestSelection→PaneSelection
+  `"HELLO"`), asserting `extract_selection_blocking` returns `Some("HELLO")`.
 
 ## Key facts for future me
 
@@ -71,13 +82,17 @@ the seam is async.
   the endpoints, so the Rust side may send anchor/cursor in any order.
 - **`rectangle` is always false today** — herdr's `Selection` has no rectangle
   field. The seam carries the flag for future block selection.
-- **Selection extraction is request/response, async on the wire.** The reply
-  becomes an `AppEvent::ClipboardWrite`, exactly like OSC 52. No UI-thread block.
-- **Scope ported = drag-select copy only.** Double-click word copy
-  (`try_double_click_copy`) and URL-at-cell (`url_at_pane_cell`) read a row's text
-  *synchronously* to compute word/URL bounds, then extract again — they can't ride
-  the async reply as-is, so they remain degraded for termhost panes. **This is the
-  in-progress follow-up (next).**
+- **Selection extraction is request/response, SYNCHRONOUS (blocking) on the Rust
+  side.** `extract_selection` for a termhost pane sends `request_selection` and
+  blocks (≤1s) on the reader thread handing back the `pane_selection` reply via a
+  per-pane one-shot. Replies are FIFO and requests are issued one at a time from the
+  UI thread (which then blocks), so a single pending slot suffices. (The first cut
+  was async-only and served just drag-copy; superseded by `e3ae3d2`.)
+- **All selection paths now work for termhost panes:** drag-select copy
+  (`copy_selection`), double-click word copy (`copy_word_at_pane_cell`), and
+  URL-at-cell (`url_at_pane_cell`) — all flow through `extract_selection`, so the
+  one branch covers them. The blocking round-trip is sub-millisecond over the local
+  socket (the daemon formats under its per-pane `emuMu`).
 - **Build/run env unchanged:** Go ghostty `PKG_CONFIG_PATH=~/projs/rust/herdr/vendor/libghostty-vt/zig-out/share/pkgconfig`;
   Rust `ZIG=~/projs/go/herdr-web/.tools/zig-wrapped`.
 - **Seam now — commands (Rust→Go):** `hello`, `create_pane`, `input`, `resize`,
@@ -91,25 +106,26 @@ the seam is async.
 - Go: default `go build ./...` + `-tags ghostty` build; `go test ./internal/...`
   (pure) + `-tags ghostty ./internal/...` (incl. `TestHostReportsPaneSelection`);
   gofmt/vet clean both modes.
-- Rust: `cargo build` (feature off) clean; `--features termhost` build + clippy
-  clean (the one `actions.rs:2726` `build_toast` / `TerminalTitleReported` warning
-  is pre-existing). `cargo test --bin herdr` = **1892 passed**; `--features
-  termhost` = **1908 passed** (+16 termhost proto tests).
+- Rust: `cargo build` (feature off) clean (the lone `TerminalTitleReported`
+  never-constructed warning is pre-existing — the variant is only built in the
+  termhost sink); `--features termhost` build + clippy clean. `cargo test --bin
+  herdr` = **1892 passed**; `--features termhost` = **1909 passed** (+17: termhost
+  proto tests + the client blocking-round-trip test).
 
 ## Commits
 
 ```
-Go   (roh/phase-b):                67f84f1 feat: selection passthrough on the termhost seam (Go side)
+Go   (roh/phase-b):                 67f84f1 feat: selection passthrough on the termhost seam (Go side)
+                                    41e923b docs: session notes (this file)
 Rust (roh/phase-b-termhost-client): ef489d3 feat: consume selection passthrough on the termhost seam (Rust side)
+                                    e3ae3d2 feat: synchronous termhost selection — drag, double-click, URL
 ```
 
 ## Next steps
 
-- **In progress this session:** double-click word copy + URL-at-cell for termhost
-  panes. They need a *synchronous* selection round-trip (read row text → compute
-  bounds → extract) — unlike drag-copy, which is fire-and-forget. Options: a
-  blocking request/response over the seam (oneshot fulfilled on the reader thread)
-  or a Go-side word/URL bounds helper. Decide and wire.
+- **Selection is fully wired** (drag + double-click + URL, all synchronous). A live
+  browser e2e (mouse-drag / double-click → clipboard) is still worth a manual run;
+  each side is unit/integration tested independently.
 - Remaining termhost degradations: kitty graphics; scroll-lock/pinning (output
   snaps to bottom); native-TUI hyperlink click resolver.
 - Daemon lifecycle: have the Rust server spawn/supervise `cmd/termhost`.
