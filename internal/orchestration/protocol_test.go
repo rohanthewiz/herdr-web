@@ -150,7 +150,8 @@ func TestCodecRoundTrip(t *testing.T) {
 		NewClosePane(42),
 		NewRequestSelection(42, SelectionPoint{Row: 3, Col: 0}, SelectionPoint{Row: 1, Col: 7}, true),
 		NewRequestText(42, uint8(terminal.TextRecent), 100, true, true),
-		NewWelcome(""),
+		NewShutdown(),
+		NewWelcome("", []uint32{1, 2, 3}),
 		NewPaneExited(42, 0),
 		NewError(42, "boom"),
 		NewPaneSelection(42, "hello world"),
@@ -175,7 +176,7 @@ func TestCodecRoundTrip(t *testing.T) {
 
 	wantTypes := []MessageType{
 		MsgHello, MsgCreatePane, MsgInput, MsgResize, MsgClosePane, MsgRequestSelection, MsgRequestText,
-		MsgWelcome, MsgPaneExited, MsgError, MsgPaneSelection, MsgPaneText, MsgPaneModes, MsgPaneFrame,
+		MsgShutdown, MsgWelcome, MsgPaneExited, MsgError, MsgPaneSelection, MsgPaneText, MsgPaneModes, MsgPaneFrame,
 	}
 	for i, want := range wantTypes {
 		typ, payload, err := ReadMessage(&buf)
@@ -187,6 +188,15 @@ func TestCodecRoundTrip(t *testing.T) {
 		}
 		// spot-check a couple of payloads decode into their structs
 		switch typ {
+		case MsgWelcome:
+			var w Welcome
+			if err := json.Unmarshal(payload, &w); err != nil {
+				t.Fatalf("decode welcome: %v", err)
+			}
+			if w.ProtocolVersion != ProtocolVersion || len(w.Panes) != 3 ||
+				w.Panes[0] != 1 || w.Panes[2] != 3 {
+				t.Errorf("welcome round-trip wrong: %+v", w)
+			}
 		case MsgRequestSelection:
 			var rs RequestSelection
 			if err := json.Unmarshal(payload, &rs); err != nil {

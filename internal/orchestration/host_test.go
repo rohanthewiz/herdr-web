@@ -612,3 +612,175 @@ func TestHostInputEchoAndClose(t *testing.T) {
 		}
 	}
 }
+
+// --- Persistence 3b: reconnect / resync ------------------------------------
+
+// newPersistentHost starts a persistent Host (panes outlive a connection) with
+// the flusher running for the test's lifetime. Idle timeout is disabled so the
+// daemon doesn't exit between connections.
+func newPersistentHost(t *testing.T) (*Host, context.Context) {
+	t.Helper()
+	h := NewHost()
+	h.FlushInterval = 5 * time.Millisecond
+	h.Persistent = true
+	h.IdleTimeout = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	h.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		h.Stop()
+	})
+	return h, ctx
+}
+
+// attachClient binds a fresh in-memory connection to the Host as the active
+// client and returns the client end plus a detach func (closes the client, which
+// ends the attachment but leaves panes running). The Hello/Welcome handshake is
+// left to the caller so tests can inspect the welcome's pane list.
+func attachClient(t *testing.T, h *Host, ctx context.Context) (client net.Conn, detach func()) {
+	t.Helper()
+	serverEnd, clientEnd := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		_ = h.Attach(ctx, serverEnd)
+		close(done)
+	}()
+	_ = clientEnd.SetDeadline(time.Now().Add(15 * time.Second))
+	t.Cleanup(func() { clientEnd.Close() })
+	return clientEnd, func() {
+		clientEnd.Close()
+		<-done
+	}
+}
+
+// waitForText reads events until a pane's accumulated frame text contains substr.
+func waitForText(t *testing.T, c net.Conn, paneID uint32, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	var transcript strings.Builder
+	for time.Now().Before(deadline) {
+		typ, payload := readEvent(t, c)
+		switch typ {
+		case MsgPaneFrame:
+			var pf PaneFrame
+			if err := json.Unmarshal(payload, &pf); err != nil {
+				t.Fatalf("decode pane_frame: %v", err)
+			}
+			if pf.PaneID == paneID {
+				transcript.WriteString(frameText(pf.Frame))
+				if strings.Contains(transcript.String(), substr) {
+					return
+				}
+			}
+		case MsgPaneExited:
+			t.Fatalf("pane %d exited before %q appeared; transcript=%q", paneID, substr, transcript.String())
+		case MsgError:
+			t.Fatalf("unexpected error event: %s", string(payload))
+		}
+	}
+	t.Fatalf("never saw %q in pane %d; transcript=%q", substr, paneID, transcript.String())
+}
+
+func containsU32(s []uint32, v uint32) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// TestHostPersistsPanesAcrossReconnect is the core 3b proof: a shell created on
+// one connection survives the client disconnecting, and a second connection
+// reconnects, is told the pane still exists (welcome.panes), is resynced its
+// prior screen, and can drive the *same* live shell.
+func TestHostPersistsPanesAcrossReconnect(t *testing.T) {
+	h, ctx := newPersistentHost(t)
+
+	// Connection 1: create a long-lived interactive shell and run a command.
+	c1, detach1 := attachClient(t, h, ctx)
+	if err := WriteMessage(c1, NewHello()); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	typ, _ := readEvent(t, c1)
+	if typ != MsgWelcome {
+		t.Fatalf("first event = %q, want welcome", typ)
+	}
+
+	cp := NewCreatePane(7, 40, 10)
+	cp.Command = "/bin/sh" // interactive (reads the PTY), stays alive
+	if err := WriteMessage(c1, cp); err != nil {
+		t.Fatalf("create_pane: %v", err)
+	}
+	if err := WriteMessage(c1, NewInput(7, []byte("printf MARK1\n"))); err != nil {
+		t.Fatalf("input: %v", err)
+	}
+	waitForText(t, c1, 7, "MARK1")
+	detach1() // client goes away; the shell must keep running
+
+	// Connection 2: reconnect. Welcome lists the surviving pane and a resync frame
+	// carries its prior screen.
+	c2, detach2 := attachClient(t, h, ctx)
+	defer detach2()
+	if err := WriteMessage(c2, NewHello()); err != nil {
+		t.Fatalf("hello 2: %v", err)
+	}
+	typ, payload := readEvent(t, c2)
+	if typ != MsgWelcome {
+		t.Fatalf("reconnect first event = %q, want welcome", typ)
+	}
+	var w Welcome
+	if err := json.Unmarshal(payload, &w); err != nil {
+		t.Fatalf("decode welcome: %v", err)
+	}
+	if !containsU32(w.Panes, 7) {
+		t.Fatalf("welcome.panes = %v, want it to list surviving pane 7", w.Panes)
+	}
+	waitForText(t, c2, 7, "MARK1") // resync replayed the prior screen
+
+	// The shell is the same live process: a new command runs in it.
+	if err := WriteMessage(c2, NewInput(7, []byte("printf MARK2\n"))); err != nil {
+		t.Fatalf("input 2: %v", err)
+	}
+	waitForText(t, c2, 7, "MARK2")
+}
+
+// TestHostShutdownCommand verifies a clean-quit shutdown triggers daemon exit.
+func TestHostShutdownCommand(t *testing.T) {
+	h, ctx := newPersistentHost(t)
+	c, _ := attachClient(t, h, ctx)
+	if err := WriteMessage(c, NewHello()); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	if typ, _ := readEvent(t, c); typ != MsgWelcome {
+		t.Fatalf("first event = %q, want welcome", typ)
+	}
+	if err := WriteMessage(c, NewShutdown()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-h.Exit():
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown command did not trigger daemon Exit")
+	}
+}
+
+// TestHostIdleTimeoutExits verifies a persistent daemon with no client attached
+// exits after the idle timeout (a crashed herdr that never reconnects).
+func TestHostIdleTimeoutExits(t *testing.T) {
+	h := NewHost()
+	h.FlushInterval = 5 * time.Millisecond
+	h.Persistent = true
+	h.IdleTimeout = 80 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		h.Stop()
+	})
+	h.Start(ctx) // arms the idle timer; no client ever attaches
+	select {
+	case <-h.Exit():
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle timeout did not fire")
+	}
+}

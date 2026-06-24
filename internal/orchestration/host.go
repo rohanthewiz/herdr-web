@@ -43,15 +43,25 @@ type pane struct {
 	prev   *terminal.Snapshot // last snapshot sent, for diffing
 	closed bool
 
-	// OSC passthrough state, owned exclusively by this pane's readPump goroutine
+	// OSC passthrough scanners, owned exclusively by this pane's readPump goroutine
 	// (libghostty-vt does not surface OSC 7 cwd, so we scan the raw byte stream).
-	osc     oscScanner
-	lastPwd string       // last OSC 7 cwd emitted, for change detection
-	osc52   osc52Scanner // OSC 52 clipboard writes (also not surfaced by go-libghostty)
-	osc9    osc9Scanner  // OSC 9 progress, owned by readPump; latest published to progress
+	osc      oscScanner
+	osc52    osc52Scanner    // OSC 52 clipboard writes (also not surfaced by go-libghostty)
+	osc9     osc9Scanner     // OSC 9 progress, owned by readPump; latest published to progress
+	oscTitle oscTitleScanner // OSC 0/2 window title, for the pane_title chrome event
 
-	oscTitle  oscTitleScanner // OSC 0/2 window title, for the pane_title chrome event
-	lastTitle string          // last OSC 0/2 title emitted, for change detection
+	// metaMu guards the last-emitted "chrome" — cwd/title/agent — so a reconnecting
+	// client can be resynced with the pane's current state by another goroutine.
+	// readPump writes cwd/title; detectPump writes the agent fields; resyncPane reads
+	// all of them.
+	metaMu         sync.Mutex
+	lastPwd        string // last OSC 7 cwd emitted, for change detection + resync
+	lastTitle      string // last OSC 0/2 title emitted, for change detection + resync
+	lastAgent      string // last pane_agent identity ("" = plain shell)
+	lastAgentState string // last pane_agent state (idle|working|blocked|unknown)
+	lastVisBlocker bool
+	lastVisWorking bool
+	hasAgent       bool // a pane_agent has been emitted at least once
 
 	// lastModes is the input-mode state last reported via pane_modes; the flusher
 	// re-queries after a dirty frame and emits only on change. hasModes guards the
@@ -76,16 +86,75 @@ func (p *pane) writePTY(b []byte) error {
 	return err
 }
 
+// setCwdMeta records a new cwd and reports whether it changed (so the caller only
+// emits pane_cwd on a real change). Held under metaMu so resyncPane can read it.
+func (p *pane) setCwdMeta(cwd string) (changed bool) {
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
+	if cwd == p.lastPwd {
+		return false
+	}
+	p.lastPwd = cwd
+	return true
+}
+
+// setTitleMeta records a new title and reports whether it changed.
+func (p *pane) setTitleMeta(title string) (changed bool) {
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
+	if title == p.lastTitle {
+		return false
+	}
+	p.lastTitle = title
+	return true
+}
+
+// setAgentMeta records the last-emitted agent identity/state for resync. Called
+// by detectPump alongside every pane_agent emission.
+func (p *pane) setAgentMeta(agent, state string, visBlocker, visWorking bool) {
+	p.metaMu.Lock()
+	p.lastAgent, p.lastAgentState = agent, state
+	p.lastVisBlocker, p.lastVisWorking = visBlocker, visWorking
+	p.hasAgent = true
+	p.metaMu.Unlock()
+}
+
 // Host is the Go terminal backend: it owns panes and serves the orchestration
-// protocol over a connection. A Host serves one connection at a time.
+// protocol. In managed mode (Serve) panes are torn down when the single
+// connection ends. In persistent mode the panes — PTYs, emulators, detection —
+// outlive any one connection: a client can Attach, drop, and a later client can
+// reconnect and resync, so live shells survive a herdr restart or binary handoff.
+// One client attaches at a time (single-writer); Attach is called serially.
 type Host struct {
 	FlushInterval time.Duration
+
+	// Persistent keeps panes alive across connection drops and arms the idle
+	// timeout. Managed mode (Serve) leaves it false.
+	Persistent bool
+	// IdleTimeout exits a persistent daemon if no client is attached for this long
+	// (a crashed herdr that never reconnects). Zero disables it. Only consulted in
+	// persistent mode.
+	IdleTimeout time.Duration
 
 	mu    sync.Mutex
 	panes map[uint32]*pane
 
-	out  chan any
-	done chan struct{}
+	// connMu guards the currently-attached client's outbound sink. out is nil when
+	// no client is attached (emit drops); sessDone is closed when the current
+	// attachment ends, so an in-flight emit on the old channel unblocks.
+	connMu   sync.Mutex
+	out      chan any
+	sessDone chan struct{}
+
+	closed     chan struct{} // closed by Stop; pumps/emit bail on it
+	closedOnce sync.Once
+	startOnce  sync.Once
+
+	exit     chan struct{} // closed on shutdown command / idle timeout; main waits on it
+	exitOnce sync.Once
+
+	idleMu    sync.Mutex
+	idleTimer *time.Timer
 }
 
 // NewHost creates an empty Host.
@@ -93,28 +162,71 @@ func NewHost() *Host {
 	return &Host{
 		FlushInterval: DefaultFlushInterval,
 		panes:         make(map[uint32]*pane),
-		out:           make(chan any, 64),
+		closed:        make(chan struct{}),
+		exit:          make(chan struct{}),
 	}
 }
 
-// Serve runs the read/write/flush loops until the connection closes or ctx is
-// cancelled, then tears down all panes. It blocks for the lifetime of the link.
-func (h *Host) Serve(ctx context.Context, conn io.ReadWriteCloser) error {
+// Start launches the daemon-lifetime flusher (panes coalesce into frames whether
+// or not a client is attached) and arms the idle timeout. Call once before the
+// first Attach. ctx bounds the flusher; Stop tears everything down.
+func (h *Host) Start(ctx context.Context) {
+	h.startOnce.Do(func() {
+		h.armIdle() // exit if a persistent daemon is spawned but no client ever attaches
+		go func() {
+			ticker := time.NewTicker(h.FlushInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-h.closed:
+					return
+				case <-ticker.C:
+					h.flushDirty()
+				}
+			}
+		}()
+	})
+}
+
+// Attach binds conn as the active client and runs the read/write loop until the
+// connection closes or ctx is cancelled. It does NOT tear down panes on return —
+// in persistent mode they keep running for the next client to reconnect and
+// resync. Returns the read error (nil on a clean EOF).
+func (h *Host) Attach(ctx context.Context, conn io.ReadWriteCloser) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	h.done = make(chan struct{})
+
+	out := make(chan any, 256)
+	sessDone := make(chan struct{})
+	h.connMu.Lock()
+	h.out = out
+	h.sessDone = sessDone
+	h.connMu.Unlock()
+	h.disarmIdle()
+
+	// Close the connection on ctx cancellation so a blocked read unblocks and the
+	// session ends on daemon shutdown, not just on a client EOF.
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-sessDone:
+		}
+	}()
 
 	var wg sync.WaitGroup
-
-	// Writer: drain outbound events to the connection.
 	wg.Add(1)
-	go func() {
+	go func() { // writer: drain outbound events to the connection
 		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case ev := <-h.out:
+			case <-sessDone:
+				return
+			case ev := <-out:
 				if err := WriteMessage(conn, ev); err != nil {
 					cancel()
 					return
@@ -123,23 +235,6 @@ func (h *Host) Serve(ctx context.Context, conn io.ReadWriteCloser) error {
 		}
 	}()
 
-	// Flusher: coalesce dirty panes into frames.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(h.FlushInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				h.flushDirty()
-			}
-		}
-	}()
-
-	// Reader: dispatch inbound commands.
 	var readErr error
 	for {
 		typ, payload, err := ReadMessage(conn)
@@ -152,17 +247,72 @@ func (h *Host) Serve(ctx context.Context, conn io.ReadWriteCloser) error {
 		h.dispatch(typ, payload)
 	}
 
+	// Detach: stop routing events to this connection (new emits drop), then unblock
+	// any in-flight emit/writer on the old channel. Panes are left running.
+	h.connMu.Lock()
+	h.out = nil
+	h.sessDone = nil
+	h.connMu.Unlock()
+	close(sessDone)
 	cancel()
-	close(h.done) // unblock any emitters
-	h.shutdownAll()
 	wg.Wait()
+	h.armIdle()
 	return readErr
+}
+
+// Stop tears down all panes and signals the flusher/pumps to exit. Idempotent.
+func (h *Host) Stop() {
+	h.closedOnce.Do(func() { close(h.closed) })
+	h.shutdownAll()
+}
+
+// Exit is closed when the daemon should stop accepting and exit — a clean-quit
+// shutdown command or the idle timeout firing. The accept loop selects on it.
+func (h *Host) Exit() <-chan struct{} { return h.exit }
+
+// requestExit signals the accept loop to exit (shutdown command / idle timeout).
+func (h *Host) requestExit() { h.exitOnce.Do(func() { close(h.exit) }) }
+
+// armIdle (persistent mode only) schedules an exit if no client reconnects within
+// IdleTimeout. Called when no client is attached.
+func (h *Host) armIdle() {
+	if !h.Persistent || h.IdleTimeout <= 0 {
+		return
+	}
+	h.idleMu.Lock()
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+	}
+	h.idleTimer = time.AfterFunc(h.IdleTimeout, h.requestExit)
+	h.idleMu.Unlock()
+}
+
+// disarmIdle cancels a pending idle exit (a client just attached).
+func (h *Host) disarmIdle() {
+	h.idleMu.Lock()
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+		h.idleTimer = nil
+	}
+	h.idleMu.Unlock()
+}
+
+// Serve runs a single connection to completion and tears down all panes — the
+// managed-mode entry (the orchestrator owns our lifecycle and we exit when it
+// disconnects). Persistent reconnects use Start/Attach/Stop directly.
+func (h *Host) Serve(ctx context.Context, conn io.ReadWriteCloser) error {
+	h.Start(ctx)
+	err := h.Attach(ctx, conn)
+	h.Stop()
+	return err
 }
 
 func (h *Host) dispatch(typ MessageType, payload []byte) {
 	switch typ {
 	case MsgHello:
-		h.emit(NewWelcome(""))
+		h.handleHello()
+	case MsgShutdown:
+		h.requestExit()
 	case MsgCreatePane:
 		var c CreatePane
 		if err := json.Unmarshal(payload, &c); err != nil {
@@ -235,6 +385,72 @@ func (h *Host) dispatch(typ MessageType, payload []byte) {
 	}
 }
 
+// handleHello answers a client's hello with a welcome listing the live pane IDs,
+// then replays each pane's current state (full frame + modes + cwd + title +
+// agent). On a fresh daemon the list is empty and nothing is replayed; on a
+// reconnect the client reconciles its restored session against these surviving
+// panes and adopts them instead of re-creating them.
+func (h *Host) handleHello() {
+	h.mu.Lock()
+	ids := make([]uint32, 0, len(h.panes))
+	ps := make([]*pane, 0, len(h.panes))
+	for id, p := range h.panes {
+		ids = append(ids, id)
+		ps = append(ps, p)
+	}
+	h.mu.Unlock()
+
+	h.emit(NewWelcome("", ids))
+	for _, p := range ps {
+		h.resyncPane(p)
+	}
+}
+
+// resyncPane replays a pane's current state to the freshly-attached client: a
+// full frame (re-baselining the diff against what the client now holds), the
+// current input modes, and the last-known cwd/title/agent. Used on reconnect so
+// an adopted pane is immediately consistent without waiting for new output.
+func (h *Host) resyncPane(p *pane) {
+	p.emuMu.Lock()
+	if p.closed {
+		p.emuMu.Unlock()
+		return
+	}
+	snap, err := p.emu.Snapshot()
+	var modes terminal.InputModes
+	var modesErr error
+	if err == nil {
+		p.prev = snap // re-baseline: subsequent diffs are relative to this full frame
+		modes, modesErr = p.emu.InputModes()
+	}
+	p.emuMu.Unlock()
+	if err != nil {
+		return
+	}
+
+	h.emit(NewPaneFrame(p.id, FrameFromSnapshot(snap, nil))) // full frame
+	if modesErr == nil {
+		// Emit current modes directly; don't touch the flusher-owned lastModes/hasModes.
+		// Re-sending modes the client already has is an idempotent mirror update.
+		h.emit(NewPaneModes(p.id, modes))
+	}
+
+	p.metaMu.Lock()
+	cwd, title := p.lastPwd, p.lastTitle
+	agent, state := p.lastAgent, p.lastAgentState
+	vb, vw, hasAgent := p.lastVisBlocker, p.lastVisWorking, p.hasAgent
+	p.metaMu.Unlock()
+	if cwd != "" {
+		h.emit(NewPaneCwd(p.id, cwd))
+	}
+	if title != "" {
+		h.emit(NewPaneTitle(p.id, title))
+	}
+	if hasAgent {
+		h.emit(NewPaneAgent(p.id, agent, state, vb, vw))
+	}
+}
+
 func (h *Host) createPane(c CreatePane) error {
 	name := c.Command
 	if name == "" {
@@ -289,8 +505,7 @@ func (h *Host) readPump(p *pane) {
 			p.dirty.Store(true)
 			p.detectSeq.Add(1) // mark new content for the detector's content-skip
 			// Scan the raw stream for OSC passthrough the emulator doesn't surface.
-			if cwd, ok := p.osc.scan(buf[:n]); ok && cwd != p.lastPwd {
-				p.lastPwd = cwd
+			if cwd, ok := p.osc.scan(buf[:n]); ok && p.setCwdMeta(cwd) {
 				h.emit(NewPaneCwd(p.id, cwd))
 			}
 			for _, clip := range p.osc52.scan(buf[:n]) {
@@ -299,8 +514,7 @@ func (h *Host) readPump(p *pane) {
 			if prog, ok := p.osc9.scan(buf[:n]); ok {
 				p.progress.Store(&prog)
 			}
-			if title, ok := p.oscTitle.scan(buf[:n]); ok && title != p.lastTitle {
-				p.lastTitle = title
+			if title, ok := p.oscTitle.scan(buf[:n]); ok && p.setTitleMeta(title) {
 				h.emit(NewPaneTitle(p.id, title))
 			}
 		}
@@ -361,7 +575,7 @@ func (h *Host) detectPump(p *pane) {
 		}
 		timer := time.NewTimer(sleep)
 		select {
-		case <-h.done:
+		case <-h.closed:
 			timer.Stop()
 			return
 		case <-timer.C:
@@ -426,11 +640,13 @@ func (h *Host) detectPump(p *pane) {
 				graceActive = true
 				state = detect.StateIdle
 				lastVIdle = true
+				p.setAgentMeta(agent, string(detect.StateIdle), false, false)
 				h.emit(NewPaneAgent(p.id, agent, string(detect.StateIdle), false, false))
 			} else {
 				// Agent gone: report the pane back to a plain shell.
 				graceActive = false
 				state = detect.StateUnknown
+				p.setAgentMeta("", string(detect.StateUnknown), false, false)
 				h.emit(NewPaneAgent(p.id, "", string(detect.StateUnknown), false, false))
 			}
 			continue
@@ -488,6 +704,7 @@ func (h *Host) detectPump(p *pane) {
 		} else {
 			hasRefresh = false
 		}
+		p.setAgentMeta(agent, string(next.state), next.visibleBlocker, next.visibleWorking)
 		h.emit(NewPaneAgent(p.id, agent, string(next.state), next.visibleBlocker, next.visibleWorking))
 	}
 }
@@ -730,10 +947,21 @@ func (h *Host) removePane(id uint32) *pane {
 	return p
 }
 
+// emit routes an event to the currently-attached client. When no client is
+// attached (out == nil) the event is dropped: panes keep running and the next
+// client gets a full resync, so a dropped frame/cwd/title costs nothing. sessDone
+// unblocks an emit that races a detach on the old channel.
 func (h *Host) emit(ev any) {
+	h.connMu.Lock()
+	out, sessDone := h.out, h.sessDone
+	h.connMu.Unlock()
+	if out == nil {
+		return
+	}
 	select {
-	case h.out <- ev:
-	case <-h.done:
+	case out <- ev:
+	case <-sessDone:
+	case <-h.closed:
 	}
 }
 

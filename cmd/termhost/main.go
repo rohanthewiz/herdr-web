@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/rohanthewiz/herdr-web/internal/orchestration"
 )
@@ -27,9 +28,19 @@ func main() {
 	socket := flag.String("socket", "/tmp/herdr-termhost.sock", "unix socket path to listen on")
 	exitOnDisconnect := flag.Bool("exit-on-disconnect", false,
 		"exit after the first client disconnects (managed mode: the orchestrator owns our lifecycle)")
+	persistent := flag.Bool("persistent", false,
+		"keep panes alive across client disconnects; a restarted/handed-off herdr reconnects and resyncs (overrides -exit-on-disconnect)")
+	idleTimeout := flag.Duration("idle-timeout", 10*time.Minute,
+		"in persistent mode, exit if no client is attached for this long (0 disables)")
 	flag.Parse()
 
-	if err := run(*socket, *exitOnDisconnect); err != nil {
+	var err error
+	if *persistent {
+		err = runPersistent(*socket, *idleTimeout)
+	} else {
+		err = run(*socket, *exitOnDisconnect)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "termhost:", err)
 		os.Exit(1)
 	}
@@ -96,5 +107,71 @@ func run(socket string, exitOnDisconnect bool) error {
 			return nil
 		}
 		go serve()
+	}
+}
+
+// runPersistent serves a single long-lived Host whose panes outlive any one
+// client. A herdr that restarts or hands off reconnects to this same daemon and
+// resyncs its surviving panes (the create_pane-less path). The daemon exits on a
+// clean-quit shutdown command, on the idle timeout, or on a signal.
+func runPersistent(socket string, idleTimeout time.Duration) error {
+	// Remove a stale socket from a previous run.
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale socket: %w", err)
+	}
+
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	defer ln.Close()
+	defer os.Remove(socket)
+
+	ctx, stop := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+
+	h := orchestration.NewHost()
+	h.Persistent = true
+	h.IdleTimeout = idleTimeout
+	h.Start(ctx)
+	defer h.Stop()
+
+	// Unblock Accept on a signal or a shutdown command / idle timeout. The Host owns
+	// panes, so closing the listener here is a clean exit (deferred Stop tears them
+	// down and the deferred socket removal runs).
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-h.Exit():
+		}
+		ln.Close()
+	}()
+
+	log.Printf("termhost listening on %s (persistent, protocol v%d)", socket, orchestration.ProtocolVersion)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// Listener closed by the shutdown goroutine: a clean exit.
+			if ctx.Err() != nil {
+				return nil
+			}
+			select {
+			case <-h.Exit():
+				return nil
+			default:
+			}
+			return fmt.Errorf("accept: %w", err)
+		}
+		log.Printf("client connected")
+		// Serial Attach is the single-writer guarantee: a second client waits in the
+		// accept backlog until the current one detaches. Panes survive the gap.
+		if err := h.Attach(ctx, conn); err != nil {
+			log.Printf("session ended: %v", err)
+		} else {
+			log.Printf("client disconnected (panes preserved)")
+		}
+		conn.Close()
 	}
 }

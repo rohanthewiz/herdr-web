@@ -39,6 +39,7 @@ const (
 	MsgScrollViewport   MessageType = "scroll_viewport"
 	MsgRequestSelection MessageType = "request_selection"
 	MsgRequestText      MessageType = "request_text"
+	MsgShutdown         MessageType = "shutdown"
 
 	// Go → Rust (events).
 	MsgWelcome       MessageType = "welcome"
@@ -175,16 +176,33 @@ func NewRequestText(id uint32, scope uint8, lines uint32, ansi, unwrap bool) Req
 	return RequestText{Type: MsgRequestText, PaneID: id, Scope: scope, Lines: lines, Ansi: ansi, Unwrap: unwrap}
 }
 
+// Shutdown asks a persistent daemon to exit and tear down all panes. The
+// orchestrator sends this on a *clean* quit so the daemon doesn't linger; a
+// crash or binary handoff instead just drops the connection (the daemon keeps
+// its panes alive for the next herdr to reconnect and resync).
+type Shutdown struct {
+	Type MessageType `json:"type"`
+}
+
+func NewShutdown() Shutdown { return Shutdown{Type: MsgShutdown} }
+
 // --- Events (Go → Rust) -----------------------------------------------------
 
 type Welcome struct {
 	Type            MessageType `json:"type"`
 	ProtocolVersion int         `json:"protocol_version"`
 	Error           string      `json:"error,omitempty"`
+	// Panes lists the pane IDs the daemon already has live when a client connects.
+	// Empty on a fresh daemon; populated when a restarted/handed-off herdr reconnects
+	// to a persistent daemon, so it can reconcile its restored session against the
+	// surviving panes (adopt the matches, expect a resync for each) instead of
+	// re-creating them. The daemon replays each pane's current state (full frame +
+	// modes + cwd + title + agent) right after this welcome.
+	Panes []uint32 `json:"panes,omitempty"`
 }
 
-func NewWelcome(errMsg string) Welcome {
-	return Welcome{Type: MsgWelcome, ProtocolVersion: ProtocolVersion, Error: errMsg}
+func NewWelcome(errMsg string, panes []uint32) Welcome {
+	return Welcome{Type: MsgWelcome, ProtocolVersion: ProtocolVersion, Error: errMsg, Panes: panes}
 }
 
 type PaneFrame struct {
