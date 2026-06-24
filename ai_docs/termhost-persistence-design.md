@@ -120,10 +120,12 @@ instead of re-spawning, then `request_resync` repaints.
   `surviving_panes − adopted` after restore (`close_restored_orphans()` wired into
   both server startup paths). Reaps a live shell the daemon kept that the restored
   session doesn't reference (e.g. spawned just before the prior herdr crashed).
-- **Server-mode clean-quit shutdown:** `run_server()` never calls
-  `termhost::shutdown()` (only the monolithic TUI path does). This is *correct* for
-  handoff (daemon must survive) but means a clean server exit leaves the daemon until
-  idle timeout. Wire a server-mode shutdown that distinguishes clean-quit from handoff.
+- ~~**Server-mode clean-quit shutdown:**~~ DONE (Rust `49cec55`). `run_server()` now
+  calls `termhost::shutdown()` after `server.run()` returns, gated on a new
+  `handed_off` flag (set in `perform_live_handoff`): a clean quit / Ctrl-C / API
+  shutdown tears the daemon down; a completed handoff leaves it running; a crash skips
+  teardown entirely. e2e `termhost_clean_server_quit_stops_daemon` (SIGINT → daemon
+  exits) pairs with the SIGKILL-survives and restart-adopts tests.
 - **Live handoff (scenario C):** shares the reconnect/adopt path and works because the
   old server doesn't kill the daemon; not yet separately e2e'd (restart/SIGKILL = B is).
 - **Single-writer hardening:** serial Attach gives the core guarantee; no explicit
