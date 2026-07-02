@@ -31,17 +31,22 @@ in-process emulator so `cargo build` no longer needs a Zig toolchain / never lin
 - **The Zig build (`build.rs`) is gated independently of the `termhost` feature** — it runs on
   every build regardless. Dropping Zig is a `build.rs` edit, separate from the feature flip.
 
-## Stage A — Make termhost the unconditional default (no deletes)
-- [ ] **A1.** `Cargo.toml [features]` (line 14): add `default = ["termhost"]` (feature is
-  `termhost = []`, line 18; there is currently **no** `default` key, so in-process is default).
-  Keep the `Actor` arms compiling. → `cargo build` builds with termhost on.
-- [ ] **A2. Decide fallback policy.** `connect_backend()` (`src/termhost/mod.rs:89`) returns
-  `None` when the daemon is unreachable/unconfigured, and the per-pane selector silently falls
-  back to in-process (`src/pane.rs:1804-1824`). Change to a **hard error** (or a temporary
-  `HERDR_TERMHOST_INPROCESS=1` escape hatch) so "default" truly lands on termhost. **Decision to
-  record.**
-- [ ] **A3. Verify.** `cargo build`, `cargo test`; run `tests/termhost_e2e.rs` with a real daemon
-  (`HERDR_TERMHOST_BIN`); confirm a normal run drives panes through the Go daemon.
+## Stage A — Make termhost the unconditional default (no deletes) — DONE (herdr `2f267ef`)
+- [x] **A1.** `Cargo.toml [features]`: `default = ["termhost"]` added. `--no-default-features`
+  still builds the legacy in-process-only binary until stages C/D.
+- [x] **A2. Fallback policy — DECIDED & RECORDED:** unreachable/unconfigured daemon is a **hard
+  error** at pane creation (`termhost::required_backend()` → `io::Error` with guidance);
+  `HERDR_TERMHOST_INPROCESS=1` is the transitional escape hatch (deleted with the in-process
+  path in stage C). **Daemon discovery** when no env var names it: `herdr-termhost` (or dev
+  `termhost`) sibling of the herdr executable, then `herdr-termhost` on PATH; env vars override.
+  Unit tests keep pre-flip in-process behavior via `cfg(test)` until the C6 rewrite.
+- [x] **A3. Verified.** `cargo build` green (needs `ZIG=<herdr-web>/.tools/zig-wrapped` on macOS
+  26.5); 1921 unit tests pass (full-suite flakes pre-exist — green in isolation and on the
+  pre-change tree); `termhost_e2e` **12/12 with a real daemon, no skips** (both
+  `HERDR_TERMHOST_SOCKET` hand-launched and `HERDR_TERMHOST_BIN` managed modes — beware: those
+  tests silently SKIP-pass when the env vars are unset); headless-server smokes confirmed
+  discovery→spawn→connect (daemon survives herdr death), the hard error at startup-workspace
+  creation, and the escape hatch spawning in-process.
 
 ## Stage B — Relocate shared plain-data types out of `src/ghostty/`
 These leak onto the app/termhost surface and must move before ghostty can be deleted.
