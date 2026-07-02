@@ -157,24 +157,24 @@ coupling**, gated behind a `PaneSpawner` seam, validated by the ported Rust test
   stable + not reused after close need the spawner seam → covered by Stage 3/W5.)*
 
 ## Stage 3 — `internal/workspace` (Tab/Workspace pure bookkeeping + spawner seam)
-- [ ] **W1. `PaneSpawner` interface** — `Spawn(spec) (PaneID, TerminalID, error)` / `Despawn(PaneID)`
+- [x] **W1. `PaneSpawner` interface** — `Spawn(spec) (PaneID, TerminalID, error)` / `Despawn(PaneID)`
   (replaces `TerminalRuntime::spawn*`). Provide a **fake/no-op spawner** for tests (mirrors Rust
   `Workspace::test_new`(871)/`test_split`(915)/`test_add_tab`(924)).
-- [ ] **W2. `Tab`** (`tab.rs:32`): fields `customName, number, rootPane, layout TileLayout,
+- [x] **W2. `Tab`** (`tab.rs:32`): fields `customName, number, rootPane, layout TileLayout,
   panes map[PaneID]PaneState, zoomed`; `PaneState{TerminalID, Seen}` (`pane/state.rs:6`). Pure
   methods: `SplitFocused[WithRatio]`(196/221 → `layout.SplitFocused` + `panes` insert + `zoomed=
   false`, spawn via seam), `CloseFocused/ClosePane/RemovePane`→`detachPane`(391-404:
   `layout.CloseFocused` + `panes` remove + `promotedRootIfNeeded` :429 + `zoomed=false`; returns
   `(PaneID, TerminalID)`).
-- [ ] **W3. `Workspace`** (`workspace.rs:140`): fields `id, customName, identityCwd, tabs []Tab,
+- [x] **W3. `Workspace`** (`workspace.rs:140`): fields `id, customName, identityCwd, tabs []Tab,
   activeTab int, publicPaneNumbers, next*Number, git-cached fields as plain optionals`. Replace
   Rust `Deref`→active-tab with an explicit `ActiveTab()` accessor. Methods: `SwitchTab`(316, flips
   `seen`) `CreateTab`(327/347) `CloseTab`(408, fix `activeTab` index) `MoveTab`(424, keep active
   identity via `rootPane`) + split/close orchestration (453-819: tab-index math +
   `findTabIndexForPane` :801 + numbering; spawn via seam).
-- [ ] **W4.** Model zoom as just the `zoomed bool` (no algorithm here; the toggle is app-level at
+- [x] **W4.** Model zoom as just the `zoomed bool` (no algorithm here; the toggle is app-level at
   `app/input/navigate.rs:824`, rendering honors it — out of WS1).
-- [ ] **W5. Port the 7 workspace tests** (`workspace.rs:950`) using the fake spawner — pane/tab
+- [x] **W5. Port the 7 workspace tests** (`workspace.rs:950`) using the fake spawner — pane/tab
   numbers stable & not reused, `move_tab` keeps active identity, identity-follows-cwd.
   **Acceptance:** pass.
 
