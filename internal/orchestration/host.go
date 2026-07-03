@@ -49,6 +49,11 @@ type pane struct {
 	osc52    osc52Scanner    // OSC 52 clipboard writes (also not surfaced by go-libghostty)
 	osc9     osc9Scanner     // OSC 9 progress, owned by readPump; latest published to progress
 	oscTitle oscTitleScanner // OSC 0/2 window title, for the pane_title chrome event
+	xtmod    xtmodkeysScanner // XTMODKEYS modifyOtherKeys (also not surfaced)
+
+	// modifyOtherKeys is the scanner's current state, published by readPump and
+	// read by the flusher/resync when reporting pane_modes.
+	modifyOtherKeys atomic.Bool
 
 	// metaMu guards the last-emitted "chrome" — cwd/title/agent — so a reconnecting
 	// client can be resynced with the pane's current state by another goroutine.
@@ -438,6 +443,7 @@ func (h *Host) resyncPane(p *pane) {
 	}
 
 	h.emit(NewPaneFrame(p.id, FrameFromSnapshot(snap, nil))) // full frame
+	modes.ModifyOtherKeys = p.modifyOtherKeys.Load()
 	if modesErr == nil {
 		// Emit current modes directly; don't touch the flusher-owned lastModes/hasModes.
 		// Re-sending modes the client already has is an idempotent mirror update.
@@ -525,6 +531,9 @@ func (h *Host) readPump(p *pane) {
 			}
 			if title, ok := p.oscTitle.scan(buf[:n]); ok && p.setTitleMeta(title) {
 				h.emit(NewPaneTitle(p.id, title))
+			}
+			if v, changed := p.xtmod.scan(buf[:n]); changed {
+				p.modifyOtherKeys.Store(v)
 			}
 		}
 		if err != nil { // EOF / EIO when the child exits or the PTY closes
@@ -905,6 +914,7 @@ func (h *Host) emitModeChanges(p *pane) {
 	if err != nil {
 		return
 	}
+	modes.ModifyOtherKeys = p.modifyOtherKeys.Load()
 	if p.hasModes && modes == p.lastModes {
 		return
 	}

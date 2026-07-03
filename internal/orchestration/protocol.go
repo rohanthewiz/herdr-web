@@ -341,6 +341,7 @@ type PaneModes struct {
 	MouseAlternateScroll bool        `json:"mouse_alternate_scroll"`
 	SynchronizedOutput   bool        `json:"synchronized_output"`
 	KittyKeyboardFlags   uint16      `json:"kitty_keyboard_flags"`
+	ModifyOtherKeys      bool        `json:"modify_other_keys,omitempty"`
 }
 
 func NewPaneModes(id uint32, m terminal.InputModes) PaneModes {
@@ -356,6 +357,7 @@ func NewPaneModes(id uint32, m terminal.InputModes) PaneModes {
 		MouseAlternateScroll: m.MouseAlternateScroll,
 		SynchronizedOutput:   m.SynchronizedOutput,
 		KittyKeyboardFlags:   m.KittyKeyboardFlags,
+		ModifyOtherKeys:      m.ModifyOtherKeys,
 	}
 }
 

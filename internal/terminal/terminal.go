@@ -138,6 +138,10 @@ type InputModes struct {
 	MouseAlternateScroll bool
 	SynchronizedOutput   bool
 	KittyKeyboardFlags   uint16 // 0 = legacy keyboard
+	// ModifyOtherKeys is xterm's XTMODKEYS state (CSI >4;Nm). libghostty-vt
+	// does not surface it, so the emulator leaves it false; the orchestration
+	// host injects the value from its raw-stream scanner before reporting.
+	ModifyOtherKeys bool
 }
 
 // At returns the cell at (col,row), or the zero Cell if out of range.
