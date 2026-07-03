@@ -67,33 +67,57 @@ in-process emulator so `cargo build` no longer needs a Zig toolchain / never lin
   failures on this machine (fail identically at `417b4b1` in isolation): `api_ping::events_
   subscribe_streams_output_and_agent_status_events` + 2 `cross_area` agent-survival tests.
 
-## Stage C — Remove selection/fallback + the in-process arms
-- [ ] **C1.** Drop the `client_if_enabled()` guard (`pane.rs:1804`) so termhost is unconditional;
-  make `finish_termhost` (`pane.rs:2305`) the sole `PaneRuntime` constructor.
-- [ ] **C2.** Delete `PaneRuntimeIo::Actor` (`pane.rs:864-865`) and every `Actor` arm across its
-  methods (`termhost_pane` 878, `shutdown` 885, `is_termhost` 902, `duplicate_handoff_fd` 914,
-  `foreground_process_group_id` 929, `begin_handoff` 940, `set_handoff_paused` 952,
-  `release_after_commit` 969, `resize` 979, `nudge_child_redraw_after_handoff` 1013,
-  `send_bytes` 1031, `try_send_bytes` 1045). Convert `TestChannel` (`869`) into the test double.
-- [ ] **C3.** Delete the in-process read path: `on_read`/child-watcher (`pane.rs:1826-1913`) and
-  the Rust detection task (`pane.rs:1915-2290`) — Go owns detection (`internal/detect`).
-- [ ] **C4.** Collapse the ~15 backend-split accessors to their termhost arm, removing the
-  `.terminal.*` fall-through: `scroll_up`(2540) `scroll_down`(2550) `scroll_reset`(2560)
-  `set_scroll_offset_from_bottom`(2570) `scroll_metrics`(2583) `cursor_state`(2599)
-  `visible_text`(2642) `visible_ansi`(2650) `detection_text`(2658) `recent_*`(2676-2705)
-  `extract_selection`(2713) `render`(2725) `collect_dirty_patch`(2734) `visible_hyperlinks`(2746).
-- [ ] **C5.** Redefine `from_handoff_fd` (`pane.rs:1625`, in-process fd import) per the
-  persistent-daemon handoff model (handoff = new server reconnects to the live daemon). Confirm
-  the `is_termhost() → continue` skips in `server/headless.rs:840-847,948,1032` become the only
-  path. **Decision to record.**
-- [ ] **C6. Test rewrite (largest hidden cost).** Delete in-process-emulator unit tests
-  (`ghostty/mod.rs` ~21, `pane/terminal.rs` ~77, `pane.rs` ~55) and rewrite the shared-helper
-  tests onto a termhost/synthetic double: `test_with_screen_bytes` / `test_process_pty_bytes` /
-  `test_with_scrollback_bytes` (defined in `pane.rs`, re-exported `terminal/runtime.rs:444-483`)
-  are used by tests in `app/api.rs`, `app/input/{copy_mode,mouse,navigate,terminal}.rs`,
-  `app/runtime.rs`, `ui.rs`, `ui/panes.rs`, `server/headless.rs`, `persist/snapshot.rs`,
-  `pane/{input,osc}.rs`. Keep `protocol/wire.rs` (47) and `terminal/state.rs` (64) tests.
-- [ ] **C7. Verify.** `cargo build` (still Zig), `cargo test`.
+## Stage C — Remove selection/fallback + the in-process arms — DONE
+## (herdr `c7c89ef` + `4875ed8` + `70b6e29`, herdr-web `21f65ce`)
+- [x] **C1.** `termhost::required_client()` replaces `client_if_enabled()`+`BackendChoice`;
+  `HERDR_TERMHOST_INPROCESS` and the `cfg(test)` in-process default are gone. `finish_termhost`
+  is the sole real constructor. Under `cfg(test)`, `spawn*` returns a channel-backed fake
+  runtime (seeds cwd + restore history, echoes input into content, executes explicit argv/shell
+  commands as plain subprocesses for marker-file/PaneDied semantics; never records the child pid
+  — it shares the test runner's session).
+- [x] **C2.** `PaneRuntimeIo::Actor` + all arms deleted; `TestChannel` is the test double.
+  `src/pty/` is dead code behind a transitional `#![allow]` (deleted in D).
+- [x] **C3.** In-process read path, child watcher, Rust detection task, and
+  `pane/agent_detection.rs` deleted. `begin_graceful_release`/`reset_agent_detection`/
+  `set_full_lifecycle_authority_active` are documented no-ops until agent lifecycle moves
+  Go-side. Dead detect/process-probe helpers carry "delete with the detect-port workstream"
+  allows.
+- [x] **C4.** `PaneTerminal` is now `Mirror(InputMirror)` | `#[cfg(test)] Fake(FakePaneTerminal)`
+  — `GhosttyPaneTerminal` and the emulator trackers (`pane/{osc,cursor,input,xtgettcap}.rs`,
+  ~3.7k LOC) are deleted. Prod accessors answer from the Go backend (termhost arm) with the
+  Mirror returning empty defaults; the render/dirty-patch wire conversion is shared
+  (`render_wire_frame`/`wire_dirty_patch`) so tests exercise the prod path.
+- [x] **C5. DECIDED: `from_handoff_fd` is deleted, not redefined.** Handoff = the replacement
+  server reconnecting to the persistent daemon and adopting live shells (welcome.panes);
+  `persist/restore.rs` treats any fd-passed pane from an older binary as a failed import and
+  respawns it seeded with snapshot history (fd closed, not leaked). The `is_termhost()` skips in
+  headless.rs remain the only path (the fd-dup/manifest machinery degenerates to empty sets;
+  full removal deferred to D/later). Fixes shipped with this: failed-handoff **rollback
+  reattaches** to the daemon (`TermhostClient::reattach`; detach-before-attempt used to leave
+  panes dark), an aborted import **preserves** adopted panes instead of closing them
+  (`preserve_runtimes_for_failed_handoff` + Drop honoring preserve for the daemon pane),
+  respawn-after-exit drops the old runtime before spawning (daemon pane-id namespace race), and
+  surviving-pane adoption is claim-once (`claim_surviving_pane`). Launch-argv respawn semantics
+  now follow `adopted_live_shell()` (the successor to the fd-import marker).
+- [x] **C6.** Unit tests: the six `test_with_*` helper signatures are unchanged, reimplemented on
+  `pane/fake_terminal.rs` — a deliberately tiny VT interpreter (text + line discipline, DEC
+  private-mode whitelist, basic SGR, cursor addressing, DECSCUSR, OSC 8, kitty CSI-u, XTMODKEYS)
+  over a wire-shaped grid; unknown sequences panic. Mode state + encoders delegate to the real
+  `InputMirror`. All ~119 helper call sites run unmodified; emulator-bound tests
+  (`pane/terminal.rs` 77, handoff/detection tests in `pane.rs`, the ghostty differential test)
+  deleted; `ghostty/mod.rs` tests survive until D deletes the module. Integration tests: the 20
+  `HERDR_TERMHOST_INPROCESS` pins are now `HERDR_TERMHOST_BIN` via
+  `support::termhost_daemon_bin()` (hard error with build instructions when the daemon binary is
+  missing — no silent skips). `live_server_holds_one_pty_master_fd_per_pane` inverted to
+  `live_server_holds_no_pty_master_fds`. **Go daemon (herdr-web `21f65ce`)** now scans the raw
+  stream for XTMODKEYS and reports `modify_other_keys` in `pane_modes`, closing the stage-B
+  divergence (modified Enter survives handoffs as CSI 27;mod;13~; the mirror also encodes it).
+- [x] **C7. Verified.** `cargo build`/`clippy` clean; unit suite 1736/1736; `termhost_e2e` 12/12
+  vs live daemon (both socket + managed modes, no skips); live_handoff 16/16, client_mode 16/16,
+  server_headless 15/15, detach_reattach 11/11, cross_area 7/9, api_ping 10/11, multi_client
+  10/11 — the 4 failures are the pre-existing machine-environmental set (multi_client broadcast
+  verified failing identically at the stage-B commit). `auto_detect`/`cli_wrapper` are
+  Linux-gated. Requires the herdr-web daemon at `21f65ce`+ next to the herdr binary.
 
 ## Stage D — Delete dead modules + drop the Zig/ghostty build
 - [ ] **D1.** Delete `src/pty/`, `src/ghostty/`, `src/pane/terminal.rs`; remove `mod pty;`/
