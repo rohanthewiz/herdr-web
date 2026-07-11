@@ -126,11 +126,12 @@ events up — consolidating today's three non-interoperating protocols:
   frame `def_fg`/`def_bg` fallback); structured key/mouse senders (D4 — no VT bytes, no key
   table); wheel → mouse event when captured or alt-screen, else `cmd scroll`; chrome rendered
   as plain HTML text (pub id, title, cwd, agent state, exit code) in the per-pane strip.
-- [ ] **4.3** Acceptance: two live shell panes in one page; focus switch routes input
+- [x] **4.3** (verified live 2026-07-11 via wsprobe2 + headless Chrome) Acceptance: two live
+  shell panes in one page; focus switch routes input
   correctly; a TUI app (e.g. `htop`) gets correct mouse + kitty-negotiated keys through the
   server-side encoder; `pane_agent` state changes visibly (run a fake agent from the herdr
   test fixtures); daemon restart survival still works (reconnect + resync full frames).
-- [ ] **4.4** `internal/wire`/`internal/herdrconn` untouched but confirmed unreferenced by
+- [x] **4.4** (verified 2026-07-11) `internal/wire`/`internal/herdrconn` untouched but confirmed unreferenced by
   the new path (they die in WS11; the old gateway mode keeps working against Rust herdr
   during transition).
 

@@ -10,6 +10,7 @@
 //	type:TEXT               structured key events per rune (\n = Enter)
 //	key:CODE[:MODS]         one named key, MODS letters c/s/a/m (e.g. key:F10, key:KeyC:c)
 //	mouse:PANE:X:Y[:BTN]    click (down+up) at cell x,y (btn default 0 = left)
+//	click_text:PANE:TEXT    poll until TEXT appears, then click its first cell
 //	wheel:PANE:X:Y:DY       wheel event (negative DY = up)
 //	scrollcmd:PANE:DELTA    cmd scroll (viewport scrollback)
 //	expect:PANE:TEXT        poll until TEXT appears in the pane grid (fails after --timeout)
@@ -258,6 +259,37 @@ func (g *paneGrid) text() string {
 	return b.String()
 }
 
+// find returns the 0-based cell coords of the first occurrence of want
+// (matched cell-per-rune, so coords stay column-accurate), or -1,-1.
+func (g *paneGrid) find(want string) (int, int) {
+	w := []rune(want)
+	if len(w) == 0 {
+		return -1, -1
+	}
+	for y := 0; y < g.H; y++ {
+		row := make([]rune, g.W)
+		for x := 0; x < g.W; x++ {
+			row[x] = ' '
+			if i := y*g.W + x; i < len(g.Cells) && g.Cells[i].S != "" {
+				row[x] = []rune(g.Cells[i].S)[0]
+			}
+		}
+		for x := 0; x+len(w) <= g.W; x++ {
+			match := true
+			for j, wr := range w {
+				if row[x+j] != wr {
+					match = false
+					break
+				}
+			}
+			if match {
+				return x, y
+			}
+		}
+	}
+	return -1, -1
+}
+
 // --- Ops ------------------------------------------------------------------------
 
 func (p *probe) exec(op string, timeout time.Duration) error {
@@ -335,6 +367,38 @@ func (p *probe) exec(op string, timeout time.Duration) error {
 			time.Sleep(30 * time.Millisecond)
 		}
 		return nil
+
+	case "click_text":
+		pane, want, err := paneText(arg)
+		if err != nil {
+			return err
+		}
+		deadline := time.Now().Add(timeout)
+		for {
+			p.mu.Lock()
+			g := p.panes[pane]
+			x, y := -1, -1
+			if g != nil {
+				x, y = g.find(want)
+			}
+			p.mu.Unlock()
+			if x >= 0 {
+				fmt.Printf("→ click_text pane=%d %q at cell=%d,%d\n", pane, want, x, y)
+				for _, kind := range []string{browserproto.MouseDown, browserproto.MouseUp} {
+					m := browserproto.Mouse{T: browserproto.MsgMouse, Pane: pane,
+						X: uint16(x), Y: uint16(y), Btn: 0, Kind: kind}
+					if err := p.send(m); err != nil {
+						return err
+					}
+					time.Sleep(30 * time.Millisecond)
+				}
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout: %q not found in pane %d", want, pane)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 
 	case "wheel":
 		f := strings.Split(arg, ":")
