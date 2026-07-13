@@ -1,6 +1,7 @@
 package browserproto
 
 import (
+	"github.com/rohanthewiz/herdr-web/internal/app"
 	"github.com/rohanthewiz/herdr-web/internal/layout"
 	"github.com/rohanthewiz/herdr-web/internal/workspace"
 )
@@ -23,25 +24,10 @@ func BorderID(path []bool) string {
 	return string(b)
 }
 
-// BorderPath decodes a BorderID back into a split path for
-// layout.TileLayout.SetRatioAt. Reports false for malformed ids.
-func BorderPath(id string) ([]bool, bool) {
-	if len(id) == 0 || id[0] != 'r' {
-		return nil, false
-	}
-	path := make([]bool, 0, len(id)-1)
-	for _, c := range id[1:] {
-		switch c {
-		case '0':
-			path = append(path, false)
-		case '1':
-			path = append(path, true)
-		default:
-			return nil, false
-		}
-	}
-	return path, true
-}
+// BorderPath decodes a BorderID back into a split path (moved to internal/app
+// with the command vocabulary, since the dispatcher decodes pane.resize_border).
+// Re-exported here so the "r01" encode/decode pair stays discoverable together.
+var BorderPath = app.BorderPath
 
 func rectOf(r layout.Rect) Rect {
 	return Rect{r.X, r.Y, r.Width, r.Height}
