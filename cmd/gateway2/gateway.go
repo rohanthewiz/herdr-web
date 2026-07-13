@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/rohanthewiz/rweb"
 
@@ -64,8 +65,28 @@ type orch struct {
 	// tab) — the panes whose frames stream to browsers (§8). Recomputed by
 	// refreshViewport whenever the viewport changes.
 	visible map[uint32]bool
-	mailbox chan func()
+	// pendingReads holds in-flight read commands awaiting the daemon's
+	// pane_selection reply, FIFO per pane (read is the only round-trip command).
+	pendingReads map[uint32][]*pendingRead
+	mailbox      chan func()
 }
+
+// pendingRead is one in-flight read command. read is unique among §7 commands in
+// needing a daemon round-trip: handleCmd sends a RequestSelection and returns
+// without replying; the pane_selection reply (resolveRead), a timeout, or a
+// daemon disconnect (flushPendingReads) resolves it. The daemon emits one
+// pane_selection per request over its single ordered connection, so per-pane
+// FIFO correlation is exact (the reply carries no command id).
+type pendingRead struct {
+	c     *client
+	id    string
+	timer *time.Timer
+}
+
+// readTimeout bounds how long a read waits for the daemon's pane_selection
+// reply, so a browser's cmd never hangs if the daemon errors or the reply is
+// lost without the connection itself dropping.
+const readTimeout = 5 * time.Second
 
 // modelSpawner satisfies workspace.PaneSpawner without touching the daemon: the
 // orchestrator syncs the daemon's PTYs to the model separately (syncDaemon), so
@@ -81,14 +102,15 @@ func (modelSpawner) Despawn(workspace.TerminalID) {}
 // one pane). Splits, tabs, and workspaces are created at runtime via commands.
 func newOrch(socket, cwd string) (*orch, error) {
 	o := &orch{
-		panes:   make(map[uint32]*paneRuntime),
-		conns:   make(map[*client]struct{}),
-		area:    defaultArea,
-		cellW:   8,
-		cellH:   16,
-		cwd:     cwd,
-		visible: make(map[uint32]bool),
-		mailbox: make(chan func(), 256),
+		panes:        make(map[uint32]*paneRuntime),
+		conns:        make(map[*client]struct{}),
+		area:         defaultArea,
+		cellW:        8,
+		cellH:        16,
+		cwd:          cwd,
+		visible:      make(map[uint32]bool),
+		pendingReads: make(map[uint32][]*pendingRead),
+		mailbox:      make(chan func(), 256),
 	}
 	o.daemon = &daemon{o: o, socket: socket}
 
@@ -284,6 +306,91 @@ func (o *orch) agentsMsg() browserproto.Agents {
 		}
 	}
 	return browserproto.NewAgents(items)
+}
+
+// --- read round-trip (loop goroutine only) -----------------------------------
+
+// startRead registers an in-flight read and asks the daemon to extract the
+// selection. The reply arrives asynchronously and completes it in resolveRead;
+// a timer fails it after readTimeout if no reply comes.
+func (o *orch) startRead(c *client, id string, p browserproto.ReadParams) {
+	pr := &pendingRead{c: c, id: id}
+	pane := p.Pane
+	o.pendingReads[pane] = append(o.pendingReads[pane], pr)
+	pr.timer = time.AfterFunc(readTimeout, func() {
+		o.post(func() { o.timeoutRead(pane, pr) })
+	})
+	o.daemon.send(orchestration.NewRequestSelection(pane,
+		orchestration.SelectionPoint{Row: p.Anchor[0], Col: uint16(p.Anchor[1])},
+		orchestration.SelectionPoint{Row: p.Cursor[0], Col: uint16(p.Cursor[1])},
+		p.Rect))
+}
+
+// resolveRead completes the oldest in-flight read for a pane with the daemon's
+// extracted text. Per-pane FIFO: the daemon replies to requests in order over
+// its single connection, and pane_selection carries no command id.
+func (o *orch) resolveRead(pane uint32, text string) {
+	q := o.pendingReads[pane]
+	if len(q) == 0 {
+		return
+	}
+	pr := q[0]
+	o.dropPending(pane, 0)
+	if pr.timer != nil {
+		pr.timer.Stop()
+	}
+	o.replyRead(pr, text, "")
+}
+
+// timeoutRead fails a still-pending read after readTimeout. It removes the read
+// by identity, not position, since a late reply may have shifted the queue.
+func (o *orch) timeoutRead(pane uint32, pr *pendingRead) {
+	for i, e := range o.pendingReads[pane] {
+		if e == pr {
+			o.dropPending(pane, i)
+			o.replyRead(pr, "", "read timed out")
+			return
+		}
+	}
+}
+
+// flushPendingReads fails every in-flight read (the daemon connection dropped,
+// so no pane_selection will arrive).
+func (o *orch) flushPendingReads(errMsg string) {
+	for pane, q := range o.pendingReads {
+		for _, pr := range q {
+			if pr.timer != nil {
+				pr.timer.Stop()
+			}
+			o.replyRead(pr, "", errMsg)
+		}
+		delete(o.pendingReads, pane)
+	}
+}
+
+// dropPending removes the read at index i from a pane's FIFO queue.
+func (o *orch) dropPending(pane uint32, i int) {
+	q := append(o.pendingReads[pane][:i], o.pendingReads[pane][i+1:]...)
+	if len(q) == 0 {
+		delete(o.pendingReads, pane)
+	} else {
+		o.pendingReads[pane] = q
+	}
+}
+
+// replyRead sends a read's cmd_result — the extracted text on success, or an
+// error. A read with no id has no result channel and is skipped.
+func (o *orch) replyRead(pr *pendingRead, text, errMsg string) {
+	if pr.id == "" {
+		return
+	}
+	var data any
+	if errMsg == "" {
+		data = browserproto.ReadResult{Text: text}
+	}
+	if r, err := browserproto.NewCmdResult(pr.id, errMsg == "", errMsg, data); err == nil {
+		o.send(pr.c, r)
+	}
 }
 
 // --- Broadcasting ------------------------------------------------------------

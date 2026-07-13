@@ -74,6 +74,7 @@ func (d *daemon) run() {
 		_ = conn.Close()
 		d.setConn(nil)
 		d.o.post(func() {
+			d.o.flushPendingReads("termhost connection lost")
 			d.o.broadcast(browserproto.NewError(0, "termhost connection lost — reconnecting"))
 		})
 	}
@@ -261,6 +262,13 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 			}
 		})
 
+	case orchestration.MsgPaneSelection:
+		var ev orchestration.PaneSelection
+		if err := json.Unmarshal(payload, &ev); err != nil {
+			return
+		}
+		o.post(func() { o.resolveRead(ev.PaneID, ev.Text) })
+
 	case orchestration.MsgError:
 		var ev orchestration.Error
 		if err := json.Unmarshal(payload, &ev); err != nil {
@@ -269,7 +277,7 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 		log.Printf("gateway2: daemon error (pane %d): %s", ev.PaneID, ev.Message)
 		o.post(func() { o.broadcast(browserproto.NewError(ev.PaneID, ev.Message)) })
 	}
-	// pane_selection / pane_text: nothing requests them yet.
+	// pane_text: nothing requests it yet.
 }
 
 // inputModesFrom rehydrates the β pane_modes mirror into the emulator-side

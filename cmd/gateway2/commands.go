@@ -190,6 +190,25 @@ func (o *orch) handleCmd(c *client, m *browserproto.Cmd) {
 		o.daemon.send(orchestration.NewScrollViewport(p.Pane, int32(p.Delta)))
 		reply(true, "")
 
+	case browserproto.CmdRead:
+		var p browserproto.ReadParams
+		if err := unmarshalParams(m.Params, &p); err != nil {
+			reply(false, "bad params: "+err.Error())
+			return
+		}
+		if m.ID == "" {
+			return // read yields only a result; with no id there's nowhere to send it
+		}
+		if o.panes[p.Pane] == nil {
+			reply(false, fmt.Sprintf("unknown pane %d", p.Pane))
+			return
+		}
+		if !o.daemon.connected() {
+			reply(false, "termhost daemon not connected")
+			return
+		}
+		o.startRead(c, m.ID, p) // async: resolveRead sends the cmd_result when the daemon replies
+
 	case browserproto.CmdTabCreate:
 		if _, err := o.session.CreateTab(); err != nil {
 			reply(false, err.Error())

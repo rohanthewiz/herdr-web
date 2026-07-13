@@ -14,6 +14,9 @@
 //	click_text:PANE:TEXT    poll until TEXT appears, then click its first cell
 //	wheel:PANE:X:Y:DY       wheel event (negative DY = up)
 //	scrollcmd:PANE:DELTA    cmd scroll (viewport scrollback)
+//	read:PANE:AROW,ACOL:CROW,CCOL[:rect]  cmd read (selection extract), await result
+//	                        (AROW/CROW may be "@TEXT" = the row where TEXT appears)
+//	readeq:TEXT             assert the last read's text equals TEXT (\n = newline)
 //	split:PANE:h|v          cmd pane.split (h = left/right, v = top/bottom)
 //	close:PANE              cmd pane.close
 //	cycle[:next|prev]       cmd pane.cycle (default next)   swap:DIR  cmd pane.swap
@@ -43,6 +46,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -99,6 +103,11 @@ type probe struct {
 	tally  map[string]int
 	errs   []string
 	dead   error
+	// reads correlates read cmd_results by their command id; lastRead holds the
+	// most recent read op's extracted text (asserted by readeq); seq mints ids.
+	reads    map[string]*browserproto.CmdResult
+	lastRead string
+	seq      int
 }
 
 func run(rawURL string, cols, rows int, script string, timeout, life time.Duration, token string) error {
@@ -125,7 +134,8 @@ func run(rawURL string, cols, rows int, script string, timeout, life time.Durati
 		return err
 	}
 
-	p := &probe{conn: conn, br: br, panes: map[uint32]*paneGrid{}, tally: map[string]int{}}
+	p := &probe{conn: conn, br: br, panes: map[uint32]*paneGrid{}, tally: map[string]int{},
+		reads: map[string]*browserproto.CmdResult{}}
 
 	init := browserproto.Init{T: browserproto.MsgInit, V: browserproto.ProtocolVersion,
 		Cols: uint16(cols), Rows: uint16(rows), DPR: 1, CellWPx: 8, CellHPx: 16}
@@ -261,6 +271,9 @@ func (p *probe) apply(msg any) {
 		fmt.Printf("← error: %s\n", m.Msg)
 	case *browserproto.CmdResult:
 		p.tally["cmd_result"]++
+		if m.ID != "" {
+			p.reads[m.ID] = m
+		}
 		if !m.Ok {
 			p.errs = append(p.errs, "cmd "+m.ID+": "+m.Error)
 		}
@@ -468,6 +481,81 @@ func (p *probe) exec(op string, timeout time.Duration) error {
 		}
 		fmt.Printf("→ cmd scroll pane=%d delta=%d\n", pane, delta)
 		return p.send(cmd)
+
+	case "read":
+		// read:PANE:AROW,ACOL:CROW,CCOL[:rect] — issue read, await its cmd_result,
+		// store + print the extracted text (assert exact value with readeq). Anchor
+		// and cursor are screen-buffer coordinates (row from the top of scrollback).
+		f := strings.Split(arg, ":")
+		if len(f) < 3 {
+			return fmt.Errorf("read needs PANE:AROW,ACOL:CROW,CCOL[:rect]")
+		}
+		pane, err := strconv.Atoi(f[0])
+		if err != nil {
+			return fmt.Errorf("bad pane %q: %w", f[0], err)
+		}
+		anchor, err := p.parsePoint(uint32(pane), f[1])
+		if err != nil {
+			return err
+		}
+		cursor, err := p.parsePoint(uint32(pane), f[2])
+		if err != nil {
+			return err
+		}
+		rect := len(f) > 3 && f[3] == "rect"
+		id := p.nextID()
+		cmd, err := browserproto.NewCmd(id, browserproto.CmdRead,
+			browserproto.ReadParams{Pane: uint32(pane), Anchor: anchor, Cursor: cursor, Rect: rect})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("→ cmd read id=%s pane=%d anchor=%v cursor=%v rect=%v\n", id, pane, anchor, cursor, rect)
+		if err := p.send(cmd); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(timeout)
+		for {
+			p.mu.Lock()
+			res, ok := p.reads[id]
+			dead := p.dead
+			p.mu.Unlock()
+			if ok {
+				if !res.Ok {
+					return fmt.Errorf("read failed: %s", res.Error)
+				}
+				var rr browserproto.ReadResult
+				if len(res.Data) > 0 {
+					if err := json.Unmarshal(res.Data, &rr); err != nil {
+						return fmt.Errorf("bad read result data: %w", err)
+					}
+				}
+				p.mu.Lock()
+				p.lastRead = rr.Text
+				p.mu.Unlock()
+				fmt.Printf("← read result %q\n", rr.Text)
+				return nil
+			}
+			if dead != nil {
+				return fmt.Errorf("connection died: %w", dead)
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout waiting for read result id=%s", id)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+	case "readeq":
+		// readeq:TEXT — assert the last read op's extracted text equals TEXT (\n
+		// for newlines). Exact match proves the daemon selection round-trip.
+		want := strings.ReplaceAll(arg, `\n`, "\n")
+		p.mu.Lock()
+		got := p.lastRead
+		p.mu.Unlock()
+		if got != want {
+			return fmt.Errorf("read text = %q, want %q", got, want)
+		}
+		fmt.Printf("✓ read text = %q\n", want)
+		return nil
 
 	case "split":
 		id, dir, ok := strings.Cut(arg, ":")
@@ -817,6 +905,47 @@ func (p *probe) exec(op string, timeout time.Duration) error {
 		return nil
 	}
 	return fmt.Errorf("unknown op %q", name)
+}
+
+// parsePoint parses "ROW,COL" into a [2]uint32{row, col} selection endpoint.
+// ROW may be "@TEXT", resolved to the viewport row where TEXT first appears —
+// which, with no scrollback yet, equals the screen-buffer (absolute) row the
+// daemon selects on. That lets a test anchor to on-screen content it just typed
+// without hardcoding a prompt-dependent row.
+func (p *probe) parsePoint(pane uint32, s string) ([2]uint32, error) {
+	rowSpec, colSpec, ok := strings.Cut(s, ",")
+	if !ok {
+		return [2]uint32{}, fmt.Errorf("point needs ROW,COL, got %q", s)
+	}
+	col, err := strconv.Atoi(colSpec)
+	if err != nil {
+		return [2]uint32{}, fmt.Errorf("bad col %q: %w", colSpec, err)
+	}
+	var row int
+	if text, isFind := strings.CutPrefix(rowSpec, "@"); isFind {
+		p.mu.Lock()
+		g := p.panes[pane]
+		y := -1
+		if g != nil {
+			_, y = g.find(text)
+		}
+		p.mu.Unlock()
+		if y < 0 {
+			return [2]uint32{}, fmt.Errorf("read anchor text %q not found in pane %d", text, pane)
+		}
+		row = y
+	} else if row, err = strconv.Atoi(rowSpec); err != nil {
+		return [2]uint32{}, fmt.Errorf("bad row %q: %w", rowSpec, err)
+	}
+	return [2]uint32{uint32(row), uint32(col)}, nil
+}
+
+// nextID mints a unique command id so read results don't collide across ops.
+func (p *probe) nextID() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seq++
+	return fmt.Sprintf("read-%d", p.seq)
 }
 
 // optPane parses a pane id, returning nil (meaning "the focused pane") for an
