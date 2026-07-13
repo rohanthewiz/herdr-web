@@ -22,9 +22,14 @@
 //
 //	termhost -socket /tmp/herdr-termhost.sock -persistent
 //
+// A local control API (WS4) exposes the same §7 command table over a unix socket
+// for CLI/automation clients (see cmd/herdrctl, internal/ctlproto). It reuses the
+// browser's app.Dispatcher unchanged; the socket is owner-only (0600).
+//
 // Usage:
 //
 //	gateway2 [--addr :8421] [--socket /tmp/herdr-termhost.sock] \
+//	         [--control-socket /tmp/herdr-control.sock] \
 //	         [--auth password|none] [--password SECRET] [--session-ttl 24h] \
 //	         [--tls] [--tls-cert cert.pem] [--tls-key key.pem]
 package main
@@ -40,6 +45,7 @@ import (
 
 	"github.com/rohanthewiz/rweb"
 
+	"github.com/rohanthewiz/herdr-web/internal/ctlproto"
 	"github.com/rohanthewiz/herdr-web/internal/gwauth"
 	"github.com/rohanthewiz/herdr-web/internal/gwtls"
 )
@@ -50,6 +56,8 @@ var webFS embed.FS
 func main() {
 	addr := flag.String("addr", ":8421", "listen address")
 	socket := flag.String("socket", "/tmp/herdr-termhost.sock", "termhost daemon socket path")
+	controlSocket := flag.String("control-socket", "",
+		"local control-API socket path (env "+ctlproto.SocketEnvVar+"; default "+ctlproto.DefaultSocket+")")
 	authMode := flag.String("auth", "password", `auth mode: "password" (login + session cookie) or "none"`)
 	password := flag.String("password", "", "shared access password/token (env HERDR_PASSWORD; generated if unset)")
 	sessionTTL := flag.Duration("session-ttl", 24*time.Hour, "session cookie lifetime")
@@ -68,11 +76,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("gateway2: %v", err)
 	}
+
+	// Local control API (WS4): a CLI/automation client drives the same §7 command
+	// table as the browser over a unix socket. Listen failure is non-fatal — the
+	// browser front-end works without it. cleanup unlinks the socket on stop.
+	controlCleanup, err := serveControl(o, ctlproto.ResolveSocket(*controlSocket))
+	if err != nil {
+		log.Printf("gateway2: control API disabled: %v", err)
+		controlCleanup = func() {}
+	}
+
 	// server.stop hook: rweb has no graceful shutdown, so exit the process after
 	// a short grace period that lets the final cmd_result + shutdown broadcast
 	// flush to browsers. The persistent termhost daemon is separate and survives.
 	o.stop = func() {
 		log.Printf("gateway2: server.stop received — shutting down")
+		controlCleanup()
 		time.AfterFunc(250*time.Millisecond, func() { os.Exit(0) })
 	}
 
