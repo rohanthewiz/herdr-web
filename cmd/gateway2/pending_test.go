@@ -26,6 +26,12 @@ func newPendingHarness() (*orch, *client) {
 	return o, c
 }
 
+// pend builds a pending whose Responder replies to client c under id — the same
+// browserResponder the dispatch uses, so results land on c.out for recvResult.
+func pend(o *orch, c *client, id string) *pending {
+	return &pending{resp: browserResponder{o: o, c: c, id: id}}
+}
+
 // recvResult pops one queued cmd_result off the client, failing if none is there.
 func recvResult(t *testing.T, c *client) *browserproto.CmdResult {
 	t.Helper()
@@ -69,7 +75,7 @@ func txtKey(pane uint32) reqKey { return reqKey{pane, reqText} }
 // reply carries no command id to match on.
 func TestResolvePendingFIFO(t *testing.T) {
 	o, c := newPendingHarness()
-	o.pendingReqs[selKey(7)] = []*pending{{c: c, id: "A"}, {c: c, id: "B"}}
+	o.pendingReqs[selKey(7)] = []*pending{pend(o, c, "A"), pend(o, c, "B")}
 
 	o.resolvePending(selKey(7), browserproto.ReadResult{Text: "first"})
 	if r := recvResult(t, c); r.ID != "A" || !r.Ok || resultText(t, r) != "first" {
@@ -93,8 +99,8 @@ func TestResolvePendingFIFO(t *testing.T) {
 // the other's pending.
 func TestResolvePendingPerPane(t *testing.T) {
 	o, c := newPendingHarness()
-	o.pendingReqs[selKey(1)] = []*pending{{c: c, id: "X"}}
-	o.pendingReqs[selKey(2)] = []*pending{{c: c, id: "Y"}}
+	o.pendingReqs[selKey(1)] = []*pending{pend(o, c, "X")}
+	o.pendingReqs[selKey(2)] = []*pending{pend(o, c, "Y")}
 
 	o.resolvePending(selKey(2), browserproto.ReadResult{Text: "two"})
 	if r := recvResult(t, c); r.ID != "Y" || resultText(t, r) != "two" {
@@ -114,8 +120,8 @@ func TestResolvePendingPerPane(t *testing.T) {
 // neither must steal the other's cmd_result even though both are on one pane.
 func TestResolvePendingPerKind(t *testing.T) {
 	o, c := newPendingHarness()
-	o.pendingReqs[selKey(3)] = []*pending{{c: c, id: "sel"}}
-	o.pendingReqs[txtKey(3)] = []*pending{{c: c, id: "txt"}}
+	o.pendingReqs[selKey(3)] = []*pending{pend(o, c, "sel")}
+	o.pendingReqs[txtKey(3)] = []*pending{pend(o, c, "txt")}
 
 	// A pane_text reply resolves the capture, leaving the read pending.
 	o.resolvePending(txtKey(3), browserproto.CaptureResult{Text: "buffer"})
@@ -137,8 +143,8 @@ func TestResolvePendingPerKind(t *testing.T) {
 // longer matches it. The error text names the command (capture here).
 func TestTimeoutPending(t *testing.T) {
 	o, c := newPendingHarness()
-	prA := &pending{c: c, id: "A"}
-	prB := &pending{c: c, id: "B"}
+	prA := pend(o, c, "A")
+	prB := pend(o, c, "B")
 	o.pendingReqs[txtKey(5)] = []*pending{prA, prB}
 
 	o.timeoutPending(txtKey(5), prA)
@@ -163,8 +169,8 @@ func TestTimeoutPending(t *testing.T) {
 // browser cmd hangs.
 func TestFlushPending(t *testing.T) {
 	o, c := newPendingHarness()
-	o.pendingReqs[selKey(1)] = []*pending{{c: c, id: "a"}}
-	o.pendingReqs[txtKey(2)] = []*pending{{c: c, id: "b"}, {c: c, id: "c"}}
+	o.pendingReqs[selKey(1)] = []*pending{pend(o, c, "a")}
+	o.pendingReqs[txtKey(2)] = []*pending{pend(o, c, "b"), pend(o, c, "c")}
 
 	o.flushPending("gone")
 
@@ -189,7 +195,7 @@ func TestFlushPending(t *testing.T) {
 // A request issued without a command id has no result channel, so nothing is sent.
 func TestReplyPendingNoID(t *testing.T) {
 	o, c := newPendingHarness()
-	o.replyPending(&pending{c: c, id: ""}, browserproto.ReadResult{Text: "ignored"}, "")
+	o.replyPending(pend(o, c, ""), browserproto.ReadResult{Text: "ignored"}, "")
 	if len(c.out) != 0 {
 		t.Fatalf("id-less request should send nothing, queued %d", len(c.out))
 	}

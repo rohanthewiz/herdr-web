@@ -306,19 +306,3 @@ func inputModesFrom(m orchestration.PaneModes) terminal.InputModes {
 		ModifyOtherKeys:      m.ModifyOtherKeys,
 	}
 }
-
-func unmarshalParams(raw json.RawMessage, v any) error {
-	if len(raw) == 0 {
-		return errors.New("missing params")
-	}
-	return json.Unmarshal(raw, v)
-}
-
-// optUnmarshalParams is unmarshalParams for commands whose fields are all
-// optional: empty params decode to the zero value rather than an error.
-func optUnmarshalParams(raw json.RawMessage, v any) error {
-	if len(raw) == 0 {
-		return nil
-	}
-	return json.Unmarshal(raw, v)
-}

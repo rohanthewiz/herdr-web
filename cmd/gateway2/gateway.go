@@ -101,14 +101,14 @@ type reqKey struct {
 	kind reqKind
 }
 
-// pending is one in-flight daemon round-trip (read or capture). handleCmd sends
-// the β request and returns without replying; the matching daemon reply
-// (resolvePending), a timeout, or a daemon disconnect (flushPending) resolves it.
-// The daemon emits one reply per request over its single ordered connection, so
-// per-(pane, kind) FIFO correlation is exact (the reply carries no command id).
+// pending is one in-flight daemon round-trip (read or capture). The dispatch
+// sends the β request and returns without replying; the matching daemon reply
+// (resolvePending), a timeout, or a daemon disconnect (flushPending) resolves the
+// caller's Responder. The daemon emits one reply per request over its single
+// ordered connection, so per-(pane, kind) FIFO correlation is exact (the reply
+// carries no command id).
 type pending struct {
-	c     *client
-	id    string
+	resp  app.Responder
 	timer *time.Timer
 }
 
@@ -346,27 +346,27 @@ func (o *orch) agentsMsg() browserproto.Agents {
 // only the request shape (startRead vs startCapture) and the reply data type
 // differ per command.
 
-// startRead registers an in-flight read and asks the daemon to extract the
-// selection. The pane_selection reply completes it in resolvePending.
-func (o *orch) startRead(c *client, id string, p browserproto.ReadParams) {
-	o.registerPending(c, id, reqKey{p.Pane, reqSelection})
+// StartRead registers an in-flight read (app.Backend) and asks the daemon to
+// extract the selection. The pane_selection reply completes r in resolvePending.
+func (o *orch) StartRead(r app.Responder, p app.ReadParams) {
+	o.registerPending(r, reqKey{p.Pane, reqSelection})
 	o.daemon.send(orchestration.NewRequestSelection(p.Pane,
 		orchestration.SelectionPoint{Row: p.Anchor[0], Col: uint16(p.Anchor[1])},
 		orchestration.SelectionPoint{Row: p.Cursor[0], Col: uint16(p.Cursor[1])},
 		p.Rect))
 }
 
-// startCapture registers an in-flight capture and asks the daemon to extract the
-// pane's buffer text. The pane_text reply completes it in resolvePending.
-func (o *orch) startCapture(c *client, id string, p browserproto.CaptureParams) {
-	o.registerPending(c, id, reqKey{p.Pane, reqText})
+// StartCapture registers an in-flight capture (app.Backend) and asks the daemon
+// to extract the pane's buffer text. The pane_text reply completes r.
+func (o *orch) StartCapture(r app.Responder, p app.CaptureParams) {
+	o.registerPending(r, reqKey{p.Pane, reqText})
 	o.daemon.send(orchestration.NewRequestText(p.Pane, p.Scope, p.Lines, p.Ansi, p.Unwrap))
 }
 
 // registerPending enqueues an in-flight request under key and arms its timeout.
 // The caller sends the β request separately (the request shape is per-command).
-func (o *orch) registerPending(c *client, id string, key reqKey) {
-	pr := &pending{c: c, id: id}
+func (o *orch) registerPending(resp app.Responder, key reqKey) {
+	pr := &pending{resp: resp}
 	o.pendingReqs[key] = append(o.pendingReqs[key], pr)
 	pr.timer = time.AfterFunc(reqTimeout, func() {
 		o.post(func() { o.timeoutPending(key, pr) })
@@ -425,17 +425,70 @@ func (o *orch) dropPending(key reqKey, i int) {
 	}
 }
 
-// replyPending sends a request's cmd_result — the reply data on success, or an
-// error. A request with no id has nowhere to send its result and is skipped.
+// replyPending completes a pending request through its Responder — the reply
+// data on success, or an error. The Responder skips a caller with no reply
+// channel (e.g. a browser cmd with no id).
 func (o *orch) replyPending(pr *pending, data any, errMsg string) {
-	if pr.id == "" {
+	if errMsg != "" {
+		pr.resp.Fail(errMsg)
 		return
 	}
-	if errMsg != "" {
-		data = nil
+	pr.resp.OK(data)
+}
+
+// --- app.Backend adapters (the runtime-effect seam) --------------------------
+//
+// orch implements app.Backend so the protocol-neutral app.Dispatcher can drive
+// it. Most are one-liners over existing orch/daemon methods; the async round-trip
+// pair (StartRead/StartCapture) is above with the pending machinery. All run on
+// the loop goroutine.
+
+// Area is the current viewport grid.
+func (o *orch) Area() layout.Rect { return o.area }
+
+// ApplyModel reconciles the daemon and rebroadcasts the viewport after a
+// model-mutating command.
+func (o *orch) ApplyModel() { o.applyModel() }
+
+// BroadcastLayout rebroadcasts just the viewport layout (focus/rename moved).
+func (o *orch) BroadcastLayout() { o.broadcast(o.viewportLayout()) }
+
+// BroadcastPaneTitle pushes a pane's effective title if it is on screen; else it
+// rides the chrome resend when the pane next becomes visible.
+func (o *orch) BroadcastPaneTitle(pane uint32) {
+	if o.visible[pane] {
+		o.broadcast(browserproto.NewPaneTitle(pane, o.effectiveTitle(pane)))
 	}
-	if r, err := browserproto.NewCmdResult(pr.id, errMsg == "", errMsg, data); err == nil {
-		o.send(pr.c, r)
+}
+
+// ScrollPane passes a scrollback delta to the pane's PTY.
+func (o *orch) ScrollPane(pane uint32, delta int) error {
+	if o.panes[pane] == nil {
+		return fmt.Errorf("unknown pane %d", pane)
+	}
+	o.daemon.send(orchestration.NewScrollViewport(pane, int32(delta)))
+	return nil
+}
+
+// PaneExists / DaemonConnected gate the async round-trip commands.
+func (o *orch) PaneExists(pane uint32) bool { return o.panes[pane] != nil }
+func (o *orch) DaemonConnected() bool       { return o.daemon.connected() }
+
+// ReloadConfig acks a config reload. gateway2 is flag-configured only — no config
+// subsystem exists yet, so this is a documented no-op; re-read config here when
+// one lands.
+func (o *orch) ReloadConfig() error {
+	log.Printf("gateway2: server.reload_config — no config subsystem yet; nothing to reload")
+	return nil
+}
+
+// Shutdown tells every browser we are going away, then fires the process-exit
+// hook (set by main). The persistent termhost daemon is a separate process and
+// deliberately survives.
+func (o *orch) Shutdown() {
+	o.broadcast(browserproto.NewShutdown())
+	if o.stop != nil {
+		o.stop()
 	}
 }
 
