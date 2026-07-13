@@ -17,6 +17,11 @@
 //	read:PANE:AROW,ACOL:CROW,CCOL[:rect]  cmd read (selection extract), await result
 //	                        (AROW/CROW may be "@TEXT" = the row where TEXT appears)
 //	readeq:TEXT             assert the last read's text equals TEXT (\n = newline)
+//	readvp:PANE:VROW,VCOL:VROW2,VCOL2[:rect]  read from VIEWPORT cells (maps to
+//	                        absolute rows via scroll, as the browser drag-select does)
+//	capture:PANE[:visible|recent][:LINES][:ansi][:unwrap]  cmd capture (buffer text), await result
+//	captureeq:TEXT          assert the last capture's text equals TEXT (\n = newline)
+//	capturehas:TEXT         assert the last capture's text contains TEXT
 //	split:PANE:h|v          cmd pane.split (h = left/right, v = top/bottom)
 //	close:PANE              cmd pane.close
 //	cycle[:next|prev]       cmd pane.cycle (default next)   swap:DIR  cmd pane.swap
@@ -94,6 +99,11 @@ type paneGrid struct {
 	Exit  *int
 	Fulls int
 	Diffs int
+	// Scroll mirrors the frame's β ScrollInfo: Off = viewport lines up from the
+	// live bottom, Max = history lines above the viewport when pinned, Rows =
+	// visible rows. Used by readvp to map viewport cells to absolute screen rows.
+	HasScroll bool
+	Off, Max  int
 }
 
 // probe is the live session state, updated by the reader goroutine.
@@ -106,11 +116,13 @@ type probe struct {
 	tally  map[string]int
 	errs   []string
 	dead   error
-	// reads correlates read cmd_results by their command id; lastRead holds the
-	// most recent read op's extracted text (asserted by readeq); seq mints ids.
-	reads    map[string]*browserproto.CmdResult
-	lastRead string
-	seq      int
+	// reads correlates read/capture cmd_results by their command id; lastRead and
+	// lastCapture hold the most recent read/capture op's extracted text (asserted
+	// by readeq / captureeq / capturehas); seq mints ids.
+	reads       map[string]*browserproto.CmdResult
+	lastRead    string
+	lastCapture string
+	seq         int
 }
 
 func run(rawURL string, cols, rows int, script string, timeout, life time.Duration, token string) error {
@@ -239,6 +251,11 @@ func (p *probe) apply(msg any) {
 		g := p.grid(m.Pane)
 		g.W, g.H = int(m.W), int(m.H)
 		g.Cells = append([]browserproto.Cell(nil), m.Cells...)
+		if m.Scroll != nil {
+			g.HasScroll, g.Off, g.Max = true, m.Scroll.Off, m.Scroll.Max
+		} else {
+			g.HasScroll = false
+		}
 		g.Fulls++
 	case *browserproto.PaneDiff:
 		p.tally["pane_diff"]++
@@ -247,6 +264,13 @@ func (p *probe) apply(msg any) {
 			if dc.I >= 0 && dc.I < len(g.Cells) {
 				g.Cells[dc.I] = dc.Cell
 			}
+		}
+		// Absent scroll ⇒ no scrollback: reset, don't retain a stale max (see the
+		// full-frame branch — matches the browser's drag-select coordinate logic).
+		if m.Scroll != nil {
+			g.HasScroll, g.Off, g.Max = true, m.Scroll.Off, m.Scroll.Max
+		} else {
+			g.HasScroll = false
 		}
 		g.Diffs++
 	case *browserproto.PaneModes:
@@ -506,46 +530,32 @@ func (p *probe) exec(op string, timeout time.Duration) error {
 			return err
 		}
 		rect := len(f) > 3 && f[3] == "rect"
-		id := p.nextID()
-		cmd, err := browserproto.NewCmd(id, browserproto.CmdRead,
-			browserproto.ReadParams{Pane: uint32(pane), Anchor: anchor, Cursor: cursor, Rect: rect})
+		return p.issueRead(uint32(pane), anchor, cursor, rect, timeout)
+
+	case "readvp":
+		// readvp:PANE:VROW,VCOL:VROW2,VCOL2[:rect] — like read, but the points are
+		// VIEWPORT cells; readvp converts each to the absolute screen-buffer row the
+		// server wants via the frame's scroll (absRow = max - off + vrow), exactly
+		// as the browser's drag-selection does. Proves that coordinate mapping
+		// against a real, scrolled daemon buffer.
+		f := strings.Split(arg, ":")
+		if len(f) < 3 {
+			return fmt.Errorf("readvp needs PANE:VROW,VCOL:VROW2,VCOL2[:rect]")
+		}
+		pane, err := strconv.Atoi(f[0])
+		if err != nil {
+			return fmt.Errorf("bad pane %q: %w", f[0], err)
+		}
+		anchor, err := p.parseViewportPoint(uint32(pane), f[1])
 		if err != nil {
 			return err
 		}
-		fmt.Printf("→ cmd read id=%s pane=%d anchor=%v cursor=%v rect=%v\n", id, pane, anchor, cursor, rect)
-		if err := p.send(cmd); err != nil {
+		cursor, err := p.parseViewportPoint(uint32(pane), f[2])
+		if err != nil {
 			return err
 		}
-		deadline := time.Now().Add(timeout)
-		for {
-			p.mu.Lock()
-			res, ok := p.reads[id]
-			dead := p.dead
-			p.mu.Unlock()
-			if ok {
-				if !res.Ok {
-					return fmt.Errorf("read failed: %s", res.Error)
-				}
-				var rr browserproto.ReadResult
-				if len(res.Data) > 0 {
-					if err := json.Unmarshal(res.Data, &rr); err != nil {
-						return fmt.Errorf("bad read result data: %w", err)
-					}
-				}
-				p.mu.Lock()
-				p.lastRead = rr.Text
-				p.mu.Unlock()
-				fmt.Printf("← read result %q\n", rr.Text)
-				return nil
-			}
-			if dead != nil {
-				return fmt.Errorf("connection died: %w", dead)
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timeout waiting for read result id=%s", id)
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
+		rect := len(f) > 3 && f[3] == "rect"
+		return p.issueRead(uint32(pane), anchor, cursor, rect, timeout)
 
 	case "readeq":
 		// readeq:TEXT — assert the last read op's extracted text equals TEXT (\n
@@ -558,6 +568,105 @@ func (p *probe) exec(op string, timeout time.Duration) error {
 			return fmt.Errorf("read text = %q, want %q", got, want)
 		}
 		fmt.Printf("✓ read text = %q\n", want)
+		return nil
+
+	case "capture":
+		// capture:PANE[:visible|recent][:LINES][:ansi][:unwrap] — issue capture,
+		// await its cmd_result, store + print the extracted buffer text (assert with
+		// captureeq / capturehas). Unlike read, capture takes no coordinates — it
+		// grabs whole rows (visible viewport, or the recent scope's last LINES rows).
+		f := strings.Split(arg, ":")
+		if len(f) < 1 || f[0] == "" {
+			return fmt.Errorf("capture needs PANE[:visible|recent][:LINES][:ansi][:unwrap]")
+		}
+		pane, err := strconv.Atoi(f[0])
+		if err != nil {
+			return fmt.Errorf("bad pane %q: %w", f[0], err)
+		}
+		params := browserproto.CaptureParams{Pane: uint32(pane)}
+		for _, opt := range f[1:] {
+			switch opt {
+			case "", "visible":
+				params.Scope = 0
+			case "recent":
+				params.Scope = 1
+			case "ansi":
+				params.Ansi = true
+			case "unwrap":
+				params.Unwrap = true
+			default:
+				n, err := strconv.Atoi(opt)
+				if err != nil {
+					return fmt.Errorf("bad capture option %q", opt)
+				}
+				params.Lines = uint32(n)
+			}
+		}
+		id := p.nextID()
+		cmd, err := browserproto.NewCmd(id, browserproto.CmdCapture, params)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("→ cmd capture id=%s pane=%d scope=%d lines=%d ansi=%v unwrap=%v\n",
+			id, pane, params.Scope, params.Lines, params.Ansi, params.Unwrap)
+		if err := p.send(cmd); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(timeout)
+		for {
+			p.mu.Lock()
+			res, ok := p.reads[id]
+			dead := p.dead
+			p.mu.Unlock()
+			if ok {
+				if !res.Ok {
+					return fmt.Errorf("capture failed: %s", res.Error)
+				}
+				var cr browserproto.CaptureResult
+				if len(res.Data) > 0 {
+					if err := json.Unmarshal(res.Data, &cr); err != nil {
+						return fmt.Errorf("bad capture result data: %w", err)
+					}
+				}
+				p.mu.Lock()
+				p.lastCapture = cr.Text
+				p.mu.Unlock()
+				fmt.Printf("← capture result %q\n", cr.Text)
+				return nil
+			}
+			if dead != nil {
+				return fmt.Errorf("connection died: %w", dead)
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout waiting for capture result id=%s", id)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+	case "captureeq":
+		// captureeq:TEXT — assert the last capture op's extracted text equals TEXT
+		// (\n for newlines). Exact match proves the daemon pane_text round-trip.
+		want := strings.ReplaceAll(arg, `\n`, "\n")
+		p.mu.Lock()
+		got := p.lastCapture
+		p.mu.Unlock()
+		if got != want {
+			return fmt.Errorf("capture text = %q, want %q", got, want)
+		}
+		fmt.Printf("✓ capture text = %q\n", want)
+		return nil
+
+	case "capturehas":
+		// capturehas:TEXT — assert the last capture op's text contains TEXT (\n for
+		// newlines). Substring form for captures whose full buffer is noisy.
+		want := strings.ReplaceAll(arg, `\n`, "\n")
+		p.mu.Lock()
+		got := p.lastCapture
+		p.mu.Unlock()
+		if !strings.Contains(got, want) {
+			return fmt.Errorf("capture text %q does not contain %q", got, want)
+		}
+		fmt.Printf("✓ capture text contains %q\n", want)
 		return nil
 
 	case "split":
@@ -973,6 +1082,74 @@ func (p *probe) parsePoint(pane uint32, s string) ([2]uint32, error) {
 		return [2]uint32{}, fmt.Errorf("bad row %q: %w", rowSpec, err)
 	}
 	return [2]uint32{uint32(row), uint32(col)}, nil
+}
+
+// parseViewportPoint parses "VROW,VCOL" (VROW may be "@TEXT") as a VIEWPORT cell,
+// then maps it to the absolute screen-buffer row the server's read wants using the
+// pane's live scroll — the same conversion the browser's drag-selection performs
+// (absRow = max - off + vrow; no scroll info ⇒ absRow = vrow).
+func (p *probe) parseViewportPoint(pane uint32, s string) ([2]uint32, error) {
+	vp, err := p.parsePoint(pane, s)
+	if err != nil {
+		return [2]uint32{}, err
+	}
+	p.mu.Lock()
+	g := p.panes[pane]
+	off, max := 0, 0
+	if g != nil && g.HasScroll {
+		off, max = g.Off, g.Max
+	}
+	p.mu.Unlock()
+	absRow := max - off + int(vp[0])
+	if absRow < 0 {
+		absRow = 0
+	}
+	return [2]uint32{uint32(absRow), vp[1]}, nil
+}
+
+// issueRead sends a read with resolved absolute endpoints, awaits its cmd_result,
+// and stores/prints the extracted text (asserted by readeq). Shared by read/readvp.
+func (p *probe) issueRead(pane uint32, anchor, cursor [2]uint32, rect bool, timeout time.Duration) error {
+	id := p.nextID()
+	cmd, err := browserproto.NewCmd(id, browserproto.CmdRead,
+		browserproto.ReadParams{Pane: pane, Anchor: anchor, Cursor: cursor, Rect: rect})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("→ cmd read id=%s pane=%d anchor=%v cursor=%v rect=%v\n", id, pane, anchor, cursor, rect)
+	if err := p.send(cmd); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		p.mu.Lock()
+		res, ok := p.reads[id]
+		dead := p.dead
+		p.mu.Unlock()
+		if ok {
+			if !res.Ok {
+				return fmt.Errorf("read failed: %s", res.Error)
+			}
+			var rr browserproto.ReadResult
+			if len(res.Data) > 0 {
+				if err := json.Unmarshal(res.Data, &rr); err != nil {
+					return fmt.Errorf("bad read result data: %w", err)
+				}
+			}
+			p.mu.Lock()
+			p.lastRead = rr.Text
+			p.mu.Unlock()
+			fmt.Printf("← read result %q\n", rr.Text)
+			return nil
+		}
+		if dead != nil {
+			return fmt.Errorf("connection died: %w", dead)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for read result id=%s", id)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // awaitCmd sends a command under a fresh id and blocks until its cmd_result

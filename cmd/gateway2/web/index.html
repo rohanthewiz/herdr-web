@@ -131,6 +131,9 @@
   // ratatui Modifier bits (cell.m).
   const M_BOLD = 0x1, M_DIM = 0x2, M_ITALIC = 0x4, M_UNDERLINED = 0x8, M_REVERSED = 0x40, M_HIDDEN = 0x80;
 
+  // Translucent wash for a browser-local drag selection (non-mouse panes, §7 read).
+  const SEL_FILL = "rgba(88,148,255,0.32)";
+
   let ws = null, cellW = 9, cellH = 19, cols = 0, rows = 0;
   let layoutMsg = null;          // last layout message
   const panes = new Map();       // pane id -> pane state
@@ -183,7 +186,7 @@
       pub: "", info: null, W: 0, H: 0, cells: [], links: [], cur: null,
       defFg: THEME_FG, defBg: THEME_BG, modes: { mouse: false, alt: false },
       title: "", cwd: "", agent: "", agentState: "", exited: null,
-      pressed: -1, lastCell: "", dirty: false };
+      pressed: -1, lastCell: "", dirty: false, scroll: null, sel: null };
     // Clicking the header (not its buttons) focuses the pane.
     chrome.addEventListener("mousedown", () => { if (p.info && !p.info.focused) sendCmd("pane.focus", { pane: id }); });
     attachMouse(p);
@@ -380,6 +383,27 @@
       ctx.fillRect(p.cur.x * cellW, p.cur.y * cellH, cellW, cellH);
       ctx.globalAlpha = 1;
     }
+    if (p.sel) drawSelection(p, ctx);
+  }
+
+  // drawSelection washes the pane-local drag range (viewport cells). Linear mode
+  // fills reading-order spans (first row from anchor, full middle rows, last row
+  // to cursor); rect mode fills the bounding box. Endpoints are inclusive, matching
+  // the server's read extraction.
+  function drawSelection(p, ctx) {
+    let a = p.sel.anchor, b = p.sel.cursor;
+    if (b.y < a.y || (b.y === a.y && b.x < a.x)) { const t = a; a = b; b = t; }
+    ctx.fillStyle = SEL_FILL;
+    if (p.sel.rect) {
+      const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x);
+      ctx.fillRect(x0 * cellW, a.y * cellH, (x1 - x0 + 1) * cellW, (b.y - a.y + 1) * cellH);
+      return;
+    }
+    for (let y = a.y; y <= b.y; y++) {
+      const sx = (y === a.y) ? a.x : 0;
+      const ex = (y === b.y) ? b.x : p.W - 1;
+      ctx.fillRect(sx * cellW, y * cellH, (ex - sx + 1) * cellW, cellH);
+    }
   }
 
   // ---- Down messages ----
@@ -394,12 +418,16 @@
         const p = pane(msg.pane);
         p.W = msg.w; p.H = msg.h; p.cells = msg.cells; p.links = msg.links || [];
         p.cur = msg.cur || null; p.defFg = msg.def_fg; p.defBg = msg.def_bg;
+        p.scroll = msg.scroll || null;
         scheduleDraw(p); break;
       }
       case "pane_diff": {
         const p = pane(msg.pane);
         if (msg.cells) for (const dc of msg.cells) p.cells[dc.i] = dc;
         if (msg.cur) p.cur = msg.cur;
+        // Every frame carries current scroll, absent ⇒ no scrollback: reset, don't
+        // retain (a stale max misplaces read coords after the buffer shrinks, e.g. clear).
+        p.scroll = msg.scroll || null;
         scheduleDraw(p); break;
       }
       case "pane_title": { const p = pane(msg.pane); p.title = msg.title; renderChrome(p); refreshPaneList(); break; }
@@ -421,7 +449,12 @@
       case "title": document.title = msg.title ? ("herdr · " + msg.title) : "herdr · gateway2"; break;
       case "error": toast("error: " + msg.msg); break;
       case "shutdown": setStatus("server shut down", true); break;
-      case "cmd_result": if (!msg.ok) toast("cmd failed: " + (msg.error || "unknown")); break;
+      case "cmd_result": {
+        const cb = cmdCbs.get(msg.id);
+        if (cb) { cmdCbs.delete(msg.id); cb(msg); }
+        else if (!msg.ok) toast("cmd failed: " + (msg.error || "unknown"));
+        break;
+      }
     }
   }
 
@@ -432,6 +465,16 @@
   // ---- Send helpers ----
   function sendMsg(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
   function sendCmd(name, params) { sendMsg({ t: "cmd", name, params }); }
+
+  // sendCmdAwait issues a command under a fresh id and resolves cb with its
+  // cmd_result (the only commands that carry a result are read/capture).
+  let cmdSeq = 0;
+  const cmdCbs = new Map();
+  function sendCmdAwait(name, params, cb) {
+    const id = "b" + (++cmdSeq);
+    cmdCbs.set(id, cb);
+    sendMsg({ t: "cmd", id, name, params });
+  }
 
   // ---- Keyboard (D4: structured, never pre-encoded) ----
   function mods(e) {
@@ -478,14 +521,47 @@
     sendMsg(m);
   }
 
+  // absPoint maps a viewport cell {x,y} to the [row, col] the server's read wants:
+  // absolute screen-buffer coordinates from the top of scrollback. The frame's
+  // scroll gives the history above the viewport (max) and how far it is scrolled up
+  // (off), so the top visible row is (max - off). No scroll info ⇒ no scrollback.
+  function absPoint(p, cell) {
+    const off = p.scroll ? p.scroll.off : 0;
+    const max = p.scroll ? p.scroll.max : 0;
+    return [max - off + cell.y, cell.x];
+  }
+
+  // finishSelection issues a read for the pane's drag range and copies the
+  // extracted text to the clipboard. Endpoints are absolute; rect selects a block.
+  function finishSelection(p) {
+    const sel = p.sel;
+    sendCmdAwait("read", {
+      pane: p.id,
+      anchor: absPoint(p, sel.anchor),
+      cursor: absPoint(p, sel.cursor),
+      rect: sel.rect,
+    }, (res) => {
+      if (!res.ok) { toast("read failed: " + (res.error || "unknown")); return; }
+      const text = res.data && res.data.text;
+      if (!text) { toast("selection is empty"); return; }
+      navigator.clipboard.writeText(text).then(
+        () => toast("copied " + text.length + " char" + (text.length === 1 ? "" : "s")),
+        () => toast("clipboard write blocked"));
+    });
+  }
+
   function attachMouse(p) {
     p.canvas.addEventListener("mousedown", (ev) => {
       if (p.info && !p.info.focused) sendCmd("pane.focus", { pane: p.id });
       if (!p.modes.mouse) {
-        // No capture: click-to-open hyperlinks, like α.
+        // No capture: left-drag originates a browser-local selection (§7 read);
+        // Alt makes it a rectangular block. A plain click (no drag) is resolved on
+        // mouseup — hyperlink follow, per α.
+        if (ev.button !== 0) return;
+        ev.preventDefault();
         const [x, y] = cellOf(p, ev);
-        const c = p.cells[y * p.W + x];
-        if (c && c.h && p.links[c.h - 1]) window.open(p.links[c.h - 1], "_blank", "noopener");
+        p.sel = { anchor: { x, y }, cursor: { x, y }, rect: ev.altKey, moved: false };
+        scheduleDraw(p);
         return;
       }
       if (ev.button > 2) return;
@@ -494,12 +570,32 @@
       sendMouse(p, "d", ev.button, ev);
     });
     window.addEventListener("mouseup", (ev) => {
+      if (p.sel) {
+        const sel = p.sel;
+        if (sel.moved) {
+          finishSelection(p);            // a real drag → read + copy, keep the wash
+        } else {
+          p.sel = null;                  // a click → follow a hyperlink under it
+          scheduleDraw(p);
+          const c = p.cells[sel.anchor.y * p.W + sel.anchor.x];
+          if (c && c.h && p.links[c.h - 1]) window.open(p.links[c.h - 1], "_blank", "noopener");
+        }
+        return;
+      }
       if (p.pressed < 0 || ev.button !== p.pressed) return;
       const btn = p.pressed;
       p.pressed = -1;
       if (p.modes.mouse) sendMouse(p, "u", btn, ev);
     });
     p.canvas.addEventListener("mousemove", (ev) => {
+      if (p.sel) {
+        const [x, y] = cellOf(p, ev);
+        if (x === p.sel.cursor.x && y === p.sel.cursor.y) return; // one update per cell
+        p.sel.cursor = { x, y };
+        if (x !== p.sel.anchor.x || y !== p.sel.anchor.y) p.sel.moved = true;
+        scheduleDraw(p);
+        return;
+      }
       if (!p.modes.mouse) return;
       const key = cellOf(p, ev).join(":");
       if (key === p.lastCell) return; // one report per cell
@@ -512,7 +608,10 @@
         : Math.sign(ev.deltaY) * Math.max(1, Math.round(Math.abs(ev.deltaY) / cellH));
       if (!lines) return;
       if (p.modes.mouse || p.modes.alt) sendMouse(p, "w", 3, ev, 0, lines);
-      else sendCmd("scroll", { pane: p.id, delta: lines });
+      else {
+        if (p.sel) { p.sel = null; scheduleDraw(p); } // scrolling invalidates the fixed-viewport wash
+        sendCmd("scroll", { pane: p.id, delta: lines });
+      }
     }, { passive: false });
     p.canvas.addEventListener("contextmenu", (ev) => { if (p.modes.mouse) ev.preventDefault(); });
   }
