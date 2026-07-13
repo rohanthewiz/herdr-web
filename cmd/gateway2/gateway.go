@@ -69,6 +69,10 @@ type orch struct {
 	// pane_selection reply, FIFO per pane (read is the only round-trip command).
 	pendingReads map[uint32][]*pendingRead
 	mailbox      chan func()
+	// stop is the process-shutdown hook wired by main (server.stop). It flushes
+	// pending browser writes, then exits — the persistent termhost daemon is a
+	// separate process and survives. nil in tests, where stop is a no-op.
+	stop func()
 }
 
 // pendingRead is one in-flight read command. read is unique among §7 commands in

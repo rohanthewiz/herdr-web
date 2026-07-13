@@ -28,6 +28,8 @@
 //	tabclose[:NUM]          cmd tab.close         wsnew         cmd workspace.create
 //	wsfocus:ID              cmd workspace.focus (ID e.g. w1)
 //	agentfocus:PANE         cmd agent.focus — reveal+focus a pane (may cross ws/tab)
+//	reloadconfig            cmd server.reload_config (awaits ack)
+//	serverstop              cmd server.stop (awaits ack; gateway then exits)
 //	panes:N|tabs:N|workspaces:N  poll until the layout reports N of that kind
 //	expect:PANE:TEXT        poll until TEXT appears (PANE may be "f" = focused pane)
 //	absent:PANE:TEXT        assert TEXT is NOT currently in the pane grid
@@ -825,6 +827,24 @@ func (p *probe) exec(op string, timeout time.Duration) error {
 			return err
 		}
 		fmt.Printf("✓ agent.focus pane=%d acked\n", pane)
+		return nil
+
+	case "reloadconfig":
+		fmt.Println("→ cmd server.reload_config")
+		if err := p.awaitCmd(browserproto.CmdServerReloadConfig, struct{}{}, timeout); err != nil {
+			return err
+		}
+		fmt.Println("✓ server.reload_config acked")
+		return nil
+
+	case "serverstop":
+		// server.stop acks, then the gateway broadcasts shutdown and exits ~250ms
+		// later; awaiting the ack proves the command round-trips before teardown.
+		fmt.Println("→ cmd server.stop")
+		if err := p.awaitCmd(browserproto.CmdServerStop, struct{}{}, timeout); err != nil {
+			return err
+		}
+		fmt.Println("✓ server.stop acked")
 		return nil
 
 	case "expect":

@@ -68,6 +68,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("gateway2: %v", err)
 	}
+	// server.stop hook: rweb has no graceful shutdown, so exit the process after
+	// a short grace period that lets the final cmd_result + shutdown broadcast
+	// flush to browsers. The persistent termhost daemon is separate and survives.
+	o.stop = func() {
+		log.Printf("gateway2: server.stop received — shutting down")
+		time.AfterFunc(250*time.Millisecond, func() { os.Exit(0) })
+	}
+
 	go o.run()        // the orchestrator event loop (sole state owner)
 	go o.daemon.run() // dial the termhost daemon
 

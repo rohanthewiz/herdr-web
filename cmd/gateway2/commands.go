@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/rohanthewiz/herdr-web/internal/browserproto"
 	"github.com/rohanthewiz/herdr-web/internal/layout"
@@ -318,6 +319,24 @@ func (o *orch) handleCmd(c *client, m *browserproto.Cmd) {
 		}
 		o.applyModel() // viewport may have changed (different workspace/tab)
 		reply(true, "")
+
+	case browserproto.CmdServerReloadConfig:
+		// No server-side config subsystem exists yet (gateway2 is flag-configured
+		// only). Acknowledge so the command is wired end-to-end; there is nothing
+		// to reload. When config lands, re-read it here.
+		log.Printf("gateway2: server.reload_config — no config subsystem yet; nothing to reload")
+		reply(true, "")
+
+	case browserproto.CmdServerStop:
+		// Clean server quit. Reply first so the browser gets its cmd_result, then
+		// tell every browser we are going away; the process exit hook (set by
+		// main) flushes those writes before exiting. The persistent termhost
+		// daemon is a separate process and deliberately survives.
+		reply(true, "")
+		o.broadcast(browserproto.NewShutdown())
+		if o.stop != nil {
+			o.stop()
+		}
 
 	default:
 		reply(false, fmt.Sprintf("command %q not supported yet (WS2 in progress)", m.Name))
