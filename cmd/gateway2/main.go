@@ -46,6 +46,7 @@ import (
 
 	"github.com/rohanthewiz/rweb"
 
+	"github.com/rohanthewiz/herdr-web/internal/config"
 	"github.com/rohanthewiz/herdr-web/internal/ctlproto"
 	"github.com/rohanthewiz/herdr-web/internal/gwauth"
 	"github.com/rohanthewiz/herdr-web/internal/gwtls"
@@ -55,6 +56,8 @@ import (
 var webFS embed.FS
 
 func main() {
+	configPath := flag.String("config", "",
+		"config file path (env "+config.EnvVar+"; default ~/.config/herdr/config.yaml)")
 	addr := flag.String("addr", ":8421", "listen address")
 	socket := flag.String("socket", "/tmp/herdr-termhost.sock", "termhost daemon socket path")
 	controlSocket := flag.String("control-socket", "",
@@ -67,21 +70,70 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "TLS private key PEM (implies --tls)")
 	flag.Parse()
 
+	// Config precedence for server settings is flag > config file > default.
+	// Start from the config (which starts from the defaults), then let any flag
+	// the operator actually passed win. flag.Visit reports only explicitly-set
+	// flags, so an unset flag never masks a config value with its default.
+	cfg, cfgPath, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("gateway2: %v", err)
+	}
+	effTTL, err := cfg.Server.TTL()
+	if err != nil {
+		log.Fatalf("gateway2: %v", err) // Load already validated, but be explicit
+	}
+	eff := cfg.Server
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if set["addr"] {
+		eff.Addr = *addr
+	}
+	if set["socket"] {
+		eff.TermhostSocket = *socket
+	}
+	if set["control-socket"] {
+		eff.ControlSocket = *controlSocket
+	}
+	if set["auth"] {
+		eff.Auth = *authMode
+	}
+	if set["session-ttl"] {
+		effTTL = *sessionTTL
+	}
+	if set["tls"] {
+		eff.TLS.Enabled = *useTLS
+	}
+	if set["tls-cert"] {
+		eff.TLS.Cert = *tlsCert
+	}
+	if set["tls-key"] {
+		eff.TLS.Key = *tlsKey
+	}
+
 	indexHTML, err := webFS.ReadFile("web/index.html")
 	if err != nil {
 		log.Fatalf("gateway2: read embedded page: %v", err)
 	}
 
 	cwd, _ := os.Getwd()
-	o, err := newOrch(*socket, cwd)
+	o, err := newOrch(eff.TermhostSocket, cwd)
 	if err != nil {
 		log.Fatalf("gateway2: %v", err)
+	}
+	// Wire the config-driven served page: baseHTML + cfgPath let server.reload_config
+	// re-render it; the initial render is stored for the "/" handler to serve.
+	o.baseHTML = indexHTML
+	o.cfgPath = cfgPath
+	initialPage := renderPage(indexHTML, cfg)
+	o.page.Store(&initialPage)
+	if cfgPath != "" {
+		log.Printf("gateway2: config %s", cfgPath)
 	}
 
 	// Local control API (WS4): a CLI/automation client drives the same §7 command
 	// table as the browser over a unix socket. Listen failure is non-fatal — the
 	// browser front-end works without it. cleanup unlinks the socket on stop.
-	controlCleanup, err := serveControl(o, ctlproto.ResolveSocket(*controlSocket))
+	controlCleanup, err := serveControl(o, ctlproto.ResolveSocket(eff.ControlSocket))
 	if err != nil {
 		log.Printf("gateway2: control API disabled: %v", err)
 		controlCleanup = func() {}
@@ -100,30 +152,30 @@ func main() {
 	go o.daemon.run() // dial the termhost daemon
 
 	// TLS: operator PEMs, or an auto-generated self-signed pair.
-	tlsOn := *useTLS || *tlsCert != "" || *tlsKey != ""
+	tlsOn := eff.TLS.Enabled || eff.TLS.Cert != "" || eff.TLS.Key != ""
 	var tlsCfg rweb.TLSCfg
 	if tlsOn {
-		certPath, keyPath, err := resolveTLS(*tlsCert, *tlsKey)
+		certPath, keyPath, err := resolveTLS(eff.TLS.Cert, eff.TLS.Key)
 		if err != nil {
 			log.Fatalf("gateway2: tls: %v", err)
 		}
-		tlsCfg = rweb.TLSCfg{UseTLS: true, TLSAddr: *addr, CertFile: certPath, KeyFile: keyPath}
+		tlsCfg = rweb.TLSCfg{UseTLS: true, TLSAddr: eff.Addr, CertFile: certPath, KeyFile: keyPath}
 	}
 
 	// Auth: build the guard unless explicitly disabled.
-	guard, err := buildGuard(*authMode, *password, *sessionTTL, tlsOn)
+	guard, err := buildGuard(eff.Auth, *password, effTTL, tlsOn)
 	if err != nil {
 		log.Fatalf("gateway2: auth: %v", err)
 	}
 
-	s := rweb.NewServer(rweb.ServerOptions{Address: *addr, TLS: tlsCfg, Verbose: true})
+	s := rweb.NewServer(rweb.ServerOptions{Address: eff.Addr, TLS: tlsCfg, Verbose: true})
 	if guard != nil {
 		s.Use(guard.middleware)
 		s.Get("/login", guard.handleLoginGet)
 		s.Post("/login", guard.handleLoginPost)
 	}
 	s.Get("/", func(ctx rweb.Context) error {
-		return ctx.WriteHTML(string(indexHTML))
+		return ctx.WriteHTML(string(*o.page.Load()))
 	})
 	s.WebSocket("/ws", func(ws *rweb.WSConn) error {
 		return o.serve(ws)
@@ -133,7 +185,7 @@ func main() {
 	if tlsOn {
 		scheme = "https"
 	}
-	log.Printf("gateway2: serving at %s://localhost%s (termhost socket %s)", scheme, *addr, *socket)
+	log.Printf("gateway2: serving at %s://localhost%s (termhost socket %s)", scheme, eff.Addr, eff.TermhostSocket)
 	log.Fatal(s.Run())
 }
 

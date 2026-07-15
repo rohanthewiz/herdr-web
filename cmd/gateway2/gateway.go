@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/rohanthewiz/rweb"
 
 	"github.com/rohanthewiz/herdr-web/internal/app"
 	"github.com/rohanthewiz/herdr-web/internal/browserproto"
+	"github.com/rohanthewiz/herdr-web/internal/config"
 	"github.com/rohanthewiz/herdr-web/internal/inputenc"
 	"github.com/rohanthewiz/herdr-web/internal/layout"
 	"github.com/rohanthewiz/herdr-web/internal/orchestration"
@@ -74,6 +76,14 @@ type orch struct {
 	// pending browser writes, then exits — the persistent termhost daemon is a
 	// separate process and survives. nil in tests, where stop is a no-op.
 	stop func()
+	// baseHTML is the un-injected served page; cfgPath is the config file to
+	// re-read on server.reload_config; page holds the config-injected page the
+	// HTTP handler serves. The handler (rweb goroutine) and ReloadConfig (loop
+	// goroutine) both touch page, so it is an atomic pointer. All three are wired
+	// by main after construction; nil/"" in tests.
+	baseHTML []byte
+	cfgPath  string
+	page     atomic.Pointer[[]byte]
 }
 
 // reqKind distinguishes the two §7 commands that need a daemon round-trip: read
@@ -474,11 +484,26 @@ func (o *orch) ScrollPane(pane uint32, delta int) error {
 func (o *orch) PaneExists(pane uint32) bool { return o.panes[pane] != nil }
 func (o *orch) DaemonConnected() bool       { return o.daemon.connected() }
 
-// ReloadConfig acks a config reload. gateway2 is flag-configured only — no config
-// subsystem exists yet, so this is a documented no-op; re-read config here when
-// one lands.
+// ReloadConfig re-reads the config file and re-renders the served page so its
+// theme and copy-mode keybindings take effect on the next page load / browser
+// connection. Server settings (addr, sockets, auth, tls) are fixed for the
+// process's lifetime — they need a restart — so this deliberately re-applies
+// only the front-end half. A missing config path or a parse/validate error
+// leaves the current page in place and reports the failure to the caller. Runs
+// on the loop goroutine; the HTTP handler reads o.page atomically.
 func (o *orch) ReloadConfig() error {
-	log.Printf("gateway2: server.reload_config — no config subsystem yet; nothing to reload")
+	if o.cfgPath == "" || o.baseHTML == nil {
+		log.Printf("gateway2: server.reload_config — no config file in use; nothing to reload")
+		return nil
+	}
+	cfg, path, err := config.Load(o.cfgPath)
+	if err != nil {
+		log.Printf("gateway2: server.reload_config failed: %v", err)
+		return err
+	}
+	page := renderPage(o.baseHTML, cfg)
+	o.page.Store(&page)
+	log.Printf("gateway2: reloaded config from %s — theme + keybindings apply to new page loads; server settings need a restart", path)
 	return nil
 }
 

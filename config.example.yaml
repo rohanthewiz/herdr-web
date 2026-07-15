@@ -1,0 +1,62 @@
+# herdr gateway2 configuration (YAML).
+#
+# Copy to ~/.config/herdr/config.yaml (or point at it with `gateway2 --config
+# <path>` / the HERDR_CONFIG env var). Every field is optional — omit anything
+# you don't want to change and the built-in default is used. For the server
+# settings a command-line flag still wins over this file, which wins over the
+# default (flag > config > default). The theme and keybindings have no flags and
+# come from this file alone.
+#
+# Edit-and-reload: after changing theme or keybindings, run `herdrctl reload`
+# (server.reload_config) to re-render the served page — no restart needed. The
+# server.* settings below are fixed for the process's lifetime; changing them
+# needs a restart.
+
+server:
+  addr: ":8421"                        # listen address (host:port or :port)
+  termhost_socket: "/tmp/herdr-termhost.sock"
+  control_socket: ""                   # "" ⇒ HERDR_CONTROL_SOCKET or /tmp/herdr-control.sock
+  auth: "password"                     # "password" (login + cookie) or "none"
+  session_ttl: "24h"                   # login cookie lifetime (Go duration)
+  # The shared secret is NOT read from this file — set HERDR_PASSWORD or pass
+  # --password so it never lands in a committed config.
+  tls:
+    enabled: false                     # true ⇒ HTTPS (auto self-signed unless cert/key given)
+    cert: ""                           # operator PEM (cert + key must be set together)
+    key: ""
+
+# Front-end appearance. Colors are the page's :root CSS custom properties
+# (without the leading --); only the ones you list are overridden.
+theme:
+  colors:
+    bg: "#181818"
+    fg: "#d4d4d4"
+    accent: "#5b9dff"
+    panel: "#141414"
+    panel2: "#1d1d1d"
+    line: "#2a2a2a"
+    muted: "#8a8a8a"
+    chrome: "#202430"
+    chrome-focus: "#26314a"
+    ok: "#6ac47a"
+    warn: "#e2b64e"
+    err: "#ff6b6b"
+  font: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace'
+
+# Keyboard bindings. Keys are DOM KeyboardEvent.key values ("ArrowLeft", "h",
+# "Escape", "0", "$", "Enter", …). Only the actions you list are rebound; the
+# rest keep their defaults.
+keybindings:
+  copy_mode:
+    move-left:  ["ArrowLeft", "h"]
+    move-right: ["ArrowRight", "l"]
+    move-up:    ["ArrowUp", "k"]
+    move-down:  ["ArrowDown", "j"]
+    line-start: ["0", "Home"]
+    line-end:   ["$", "End"]
+    top:        ["g"]
+    bottom:     ["G"]
+    select:     ["v"]
+    rect:       ["r"]
+    yank:       ["y", "Enter"]
+    exit:       ["Escape", "q"]

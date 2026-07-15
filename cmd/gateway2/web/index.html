@@ -641,6 +641,24 @@
     p.sel = cm.anchor ? { anchor: cm.anchor, cursor: cm.cursor, rect: cm.rect, moved: true } : null;
   }
 
+  // Copy-mode keybindings. gateway2 injects window.__herdrKeys.copyMode
+  // (action → [keys]) from the YAML config; this built-in table is the fallback
+  // when the page is served standalone or the config omits copy_mode. We index it
+  // as key → action so copyModeKey is a switch on the action, not the raw key.
+  const COPY_MODE_DEFAULT = {
+    "move-left": ["ArrowLeft", "h"], "move-right": ["ArrowRight", "l"],
+    "move-up": ["ArrowUp", "k"], "move-down": ["ArrowDown", "j"],
+    "line-start": ["0", "Home"], "line-end": ["$", "End"],
+    "top": ["g"], "bottom": ["G"], "select": ["v"], "rect": ["r"],
+    "yank": ["y", "Enter"], "exit": ["Escape", "q"],
+  };
+  const COPY_KEY = (() => {
+    const table = (window.__herdrKeys && window.__herdrKeys.copyMode) || COPY_MODE_DEFAULT;
+    const map = {};
+    for (const action in table) for (const k of (table[action] || [])) map[k] = action;
+    return map;
+  })();
+
   // copyModeKey handles one keydown while in copy-mode; returns without touching
   // the terminal (onKey has already swallowed the event).
   function copyModeKey(p, e) {
@@ -654,20 +672,20 @@
       else if (ny > p.H - 1) { sendCmd("scroll", { pane: p.id, delta: 1 }); ny = p.H - 1; }
       cm.cursor = { x: clampX(cm.cursor.x + dx), y: clampY(ny) };
     };
-    switch (e.key) {
-      case "ArrowLeft": case "h": move(-1, 0); break;
-      case "ArrowRight": case "l": move(1, 0); break;
-      case "ArrowUp": case "k": move(0, -1); break;
-      case "ArrowDown": case "j": move(0, 1); break;
-      case "0": case "Home": cm.cursor = { x: 0, y: cm.cursor.y }; break;
-      case "$": case "End": cm.cursor = { x: Math.max(0, p.W - 1), y: cm.cursor.y }; break;
-      case "g": cm.cursor = { x: cm.cursor.x, y: 0 }; break;
-      case "G": cm.cursor = { x: cm.cursor.x, y: Math.max(0, p.H - 1) }; break;
-      case "v": cm.anchor = cm.anchor ? null : { x: cm.cursor.x, y: cm.cursor.y }; break;
-      case "r": cm.rect = !cm.rect; break;
-      case "y": case "Enter": copyModeYank(p); return;
-      case "Escape": case "q": exitCopyMode(); return;
-      default: return; // unrecognised key: stay in copy-mode, do nothing
+    switch (COPY_KEY[e.key]) {
+      case "move-left": move(-1, 0); break;
+      case "move-right": move(1, 0); break;
+      case "move-up": move(0, -1); break;
+      case "move-down": move(0, 1); break;
+      case "line-start": cm.cursor = { x: 0, y: cm.cursor.y }; break;
+      case "line-end": cm.cursor = { x: Math.max(0, p.W - 1), y: cm.cursor.y }; break;
+      case "top": cm.cursor = { x: cm.cursor.x, y: 0 }; break;
+      case "bottom": cm.cursor = { x: cm.cursor.x, y: Math.max(0, p.H - 1) }; break;
+      case "select": cm.anchor = cm.anchor ? null : { x: cm.cursor.x, y: cm.cursor.y }; break;
+      case "rect": cm.rect = !cm.rect; break;
+      case "yank": copyModeYank(p); return;
+      case "exit": exitCopyMode(); return;
+      default: return; // unbound key: stay in copy-mode, do nothing
     }
     cmSyncSel(p);
     scheduleDraw(p);
