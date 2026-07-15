@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -39,6 +40,36 @@ func (o *orch) controlDispatch(method string, params json.RawMessage, r app.Resp
 	})
 }
 
+// ctlSubscriber is one control-API event stream (events.subscribe): a
+// ctlproto.Subscriber sink onto the client connection plus the subscription's
+// filter. controlStream registers it on the loop; emitEvent pushes matching pane
+// events; a full/dead sink is dropped.
+type ctlSubscriber struct {
+	sub    ctlproto.Subscriber
+	filter app.EventsSubscribeParams
+}
+
+// controlStream starts a streaming control method (events.subscribe): it decodes
+// the optional filter, registers a subscriber on the orchestrator loop, and
+// returns a cancel that removes it when the client disconnects. Registration and
+// removal both post onto the loop (the sole owner of o.subs); the ctlproto server
+// pumps the events the loop pushes onto the subscriber. This is the streaming
+// analogue of controlDispatch.
+func (o *orch) controlStream(method string, params json.RawMessage, sub ctlproto.Subscriber) (func(), error) {
+	if method != ctlproto.MethodEventsSubscribe {
+		return nil, fmt.Errorf("unknown streaming method %q", method)
+	}
+	var f app.EventsSubscribeParams
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &f); err != nil {
+			return nil, fmt.Errorf("bad params: %v", err)
+		}
+	}
+	s := &ctlSubscriber{sub: sub, filter: f}
+	o.post(func() { o.subs[s] = struct{}{} })
+	return func() { o.post(func() { delete(o.subs, s) }) }, nil
+}
+
 // serveControl opens the control socket and serves the local control API until
 // the process exits. It removes a stale socket left by a crashed run, restricts
 // the socket to the owner (0600), and returns a cleanup that closes the listener
@@ -60,6 +91,7 @@ func serveControl(o *orch, socket string) (cleanup func(), err error) {
 		log.Printf("gateway2: control socket chmod: %v", err)
 	}
 	srv := ctlproto.NewServer(o.controlDispatch, controlTimeout, "gateway2")
+	srv.SetStreamDispatch(o.controlStream) // events.subscribe
 	go func() {
 		if err := srv.Serve(l); err != nil {
 			log.Printf("gateway2: control server stopped: %v", err)

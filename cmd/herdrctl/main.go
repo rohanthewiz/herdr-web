@@ -20,6 +20,13 @@
 //	herdrctl new-tab        → tab.create
 //	herdrctl stop           → server.stop
 //
+// Two verbs block/stream instead of returning at once: `wait <pane> <pattern>`
+// resolves when the pane's output contains the pattern (or times out), and
+// `events [pane]` streams pane events (exit/agent/title/cwd) until Ctrl-C:
+//
+//	herdrctl wait 1 "BUILD SUCCESSFUL" 120   → pane.wait_for_output (120s)
+//	herdrctl events 1                        → events.subscribe {"pane":1}
+//
 // The raw form reaches any §7 command directly (and the rarely-scripted options
 // like read's rect or capture's ansi/unwrap that the ergonomic verbs omit):
 //
@@ -32,10 +39,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"slices"
 	"time"
 
@@ -95,8 +104,10 @@ func run() int {
 		params = built
 	} else {
 		// Validate the method locally so a typo lists the vocabulary instead of a
-		// round trip to the server's "not supported yet" default.
-		if method != ctlproto.MethodPing && !slices.Contains(app.CommandNames(), method) {
+		// round trip to the server's "not supported yet" default. ping and the
+		// streaming events.subscribe are transport methods outside the §7 table.
+		if method != ctlproto.MethodPing && method != ctlproto.MethodEventsSubscribe &&
+			!slices.Contains(app.CommandNames(), method) {
 			fmt.Fprintf(os.Stderr, "herdrctl: unknown command %q (try `herdrctl help`)\n", method)
 			return 2
 		}
@@ -113,8 +124,27 @@ func run() int {
 		}
 	}
 
-	resp, err := ctlproto.Call(ctlproto.ResolveSocket(*socket),
-		ctlproto.Request{ID: *id, Method: method, Params: params}, *timeout)
+	socketPath := ctlproto.ResolveSocket(*socket)
+
+	// events.subscribe streams frames until interrupted — a different transport
+	// than the unary Call below.
+	if method == ctlproto.MethodEventsSubscribe {
+		return runEvents(socketPath, *id, params)
+	}
+
+	// wait_for_output blocks until its pattern appears; size the round-trip deadline
+	// to cover the wait itself (unless an explicit --timeout is already larger).
+	callTimeout := *timeout
+	if method == app.CmdWaitForOutput {
+		var wp app.WaitForOutputParams
+		_ = json.Unmarshal(params, &wp)
+		if need := app.WaitTimeout(wp.TimeoutMs) + 10*time.Second; callTimeout < need {
+			callTimeout = need
+		}
+	}
+
+	resp, err := ctlproto.Call(socketPath,
+		ctlproto.Request{ID: *id, Method: method, Params: params}, callTimeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herdrctl: %v\n", err)
 		return 2
@@ -149,6 +179,28 @@ func printResult(resp ctlproto.Response) {
 		return
 	}
 	fmt.Println(buf.String())
+}
+
+// runEvents opens an events.subscribe stream and prints each event as one line of
+// JSON until the server closes it or the user interrupts (Ctrl-C). Exit 0 on a
+// clean end (server stop or Ctrl-C), 2 on a transport/subscription error.
+func runEvents(socket, id string, params json.RawMessage) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	req := ctlproto.Request{ID: id, Method: ctlproto.MethodEventsSubscribe, Params: params}
+	err := ctlproto.Subscribe(ctx, socket, req, func(ev ctlproto.Event) error {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(b))
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herdrctl: %v\n", err)
+		return 2
+	}
+	return 0
 }
 
 func usage() {

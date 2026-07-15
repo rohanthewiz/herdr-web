@@ -24,6 +24,9 @@ type Dispatch func(method string, params json.RawMessage, r app.Responder)
 // the Dispatch func — so the same Server serves any app.Backend.
 type Server struct {
 	dispatch Dispatch
+	// stream handles the streaming method (events.subscribe); nil until
+	// SetStreamDispatch is called, in which case a subscribe request is rejected.
+	stream StreamDispatch
 	// timeout bounds how long a connection waits for the dispatch to resolve its
 	// responder — a backstop above the orchestrator's own read/capture timeout so
 	// a wedged command can't pin a connection (and its goroutine) forever.
@@ -50,13 +53,19 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 }
 
-// handleConn answers one request on conn, then closes it (one request per
-// connection).
+// handleConn answers one request on conn. A unary request gets one Response and
+// the connection closes; a subscribe request keeps the connection open and streams
+// events (handleStream) until the client disconnects.
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	req, err := readRequest(bufio.NewReader(conn))
+	br := bufio.NewReader(conn)
+	req, err := readRequest(br)
 	if err != nil {
 		return // unreadable/closed before a full request — nothing to answer
+	}
+	if req.Method == MethodEventsSubscribe {
+		s.handleStream(conn, br, req)
+		return
 	}
 	if err := writeMessage(conn, s.handle(req)); err != nil {
 		log.Printf("ctlproto: write response: %v", err)
@@ -72,17 +81,28 @@ func (s *Server) handle(req Request) Response {
 	return s.dispatchAndWait(req)
 }
 
+// awaitBackstop is the connection backstop for pane.wait_for_output, whose own
+// timeout can run up to app.MaxWaitTimeout. It sits above that ceiling so the
+// backend's waiter always resolves on its own timer first; this only trips if the
+// dispatch itself wedges (a bug), keeping the goroutine bounded.
+const awaitBackstop = app.MaxWaitTimeout + 15*time.Second
+
 // dispatchAndWait runs the command through the dispatch func and blocks for its
 // result. The responder delivers OK/Fail onto a buffered channel, so a command
-// that resolves synchronously (most) or asynchronously (read/capture, resolved
-// later on the loop goroutine) both land here; timeout is the backstop.
+// that resolves synchronously (most) or asynchronously (read/capture/wait_for_output,
+// resolved later on the loop goroutine) both land here; the backstop bounds a
+// wedged dispatch — a generous one for wait_for_output, which is meant to block.
 func (s *Server) dispatchAndWait(req Request) Response {
+	backstop := s.timeout
+	if req.Method == app.CmdWaitForOutput {
+		backstop = awaitBackstop
+	}
 	cr := &chanResponder{ch: make(chan Response, 1), id: req.ID}
 	s.dispatch(req.Method, req.Params, cr)
 	select {
 	case resp := <-cr.ch:
 		return resp
-	case <-time.After(s.timeout):
+	case <-time.After(backstop):
 		return newResponse(req.ID, false, "command timed out", nil)
 	}
 }

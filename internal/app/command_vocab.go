@@ -1,6 +1,14 @@
 package app
 
-import "github.com/rohanthewiz/herdr-web/internal/layout"
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/rohanthewiz/herdr-web/internal/layout"
+)
 
 // This file is the protocol-neutral §7 command vocabulary: the command names,
 // their parameter/result structs, and the small string→enum mappings the
@@ -25,6 +33,7 @@ const (
 	CmdScroll             = "scroll"
 	CmdRead               = "read"
 	CmdCapture            = "capture"
+	CmdWaitForOutput      = "pane.wait_for_output"
 	CmdTabCreate          = "tab.create"
 	CmdTabClose           = "tab.close"
 	CmdTabFocus           = "tab.focus"
@@ -55,7 +64,7 @@ func CommandNames() []string {
 	return []string{
 		CmdPaneSplit, CmdPaneClose, CmdPaneFocus, CmdPaneFocusDirection,
 		CmdPaneCycle, CmdPaneLast, CmdPaneSwap, CmdPaneZoom, CmdPaneRename,
-		CmdPaneResizeBorder, CmdScroll, CmdRead, CmdCapture,
+		CmdPaneResizeBorder, CmdScroll, CmdRead, CmdCapture, CmdWaitForOutput,
 		CmdTabCreate, CmdTabClose, CmdTabFocus, CmdTabRename,
 		CmdWorkspaceCreate, CmdWorkspaceClose, CmdWorkspaceFocus, CmdWorkspaceRename,
 		CmdAgentFocus, CmdServerReloadConfig, CmdServerStop,
@@ -203,6 +212,92 @@ type CaptureParams struct {
 // CaptureResult is CmdResult.Data for a successful capture.
 type CaptureResult struct {
 	Text string `json:"text"`
+}
+
+// WaitForOutputParams: pane.wait_for_output — block until the pane's recent
+// buffer text matches Pattern (a substring, or a regexp when Regex is set), or
+// until TimeoutMs elapses. Unlike read/capture (one round-trip), this rides the
+// unary envelope but resolves only when the match appears: the backend re-scans
+// the pane's captured text as it produces output. Lines bounds how many recent
+// rows are scanned (0 = the whole buffer); the scan is over plain text (no VT
+// styling, soft-wraps rejoined). TimeoutMs 0 uses the server default.
+type WaitForOutputParams struct {
+	Pane      uint32 `json:"pane"`
+	Pattern   string `json:"pattern"`
+	Regex     bool   `json:"regex,omitempty"`
+	TimeoutMs uint32 `json:"timeout_ms,omitempty"`
+	Lines     uint32 `json:"lines,omitempty"`
+}
+
+// WaitForOutputResult is CmdResult.Data for pane.wait_for_output. Matched reports
+// whether Pattern appeared before the timeout (false = timed out or the pane
+// exited first); Text is the buffer line the match landed on, for context.
+type WaitForOutputResult struct {
+	Matched bool   `json:"matched"`
+	Text    string `json:"text,omitempty"`
+}
+
+// Matcher compiles Pattern into a predicate over a pane's captured text: it
+// returns the matched line (trimmed, for the result's Text) and whether the
+// pattern is present. It also validates the params — an empty pattern or an
+// uncompilable regex is an error the dispatcher reports as bad params before it
+// registers a waiter. The backend calls Matcher to get the live predicate.
+func (p WaitForOutputParams) Matcher() (func(text string) (line string, ok bool), error) {
+	if p.Pattern == "" {
+		return nil, errors.New("wait_for_output: empty pattern")
+	}
+	if p.Regex {
+		re, err := regexp.Compile(p.Pattern)
+		if err != nil {
+			return nil, fmt.Errorf("wait_for_output: bad regex %q: %w", p.Pattern, err)
+		}
+		return func(text string) (string, bool) {
+			loc := re.FindStringIndex(text)
+			if loc == nil {
+				return "", false
+			}
+			return lineAround(text, loc[0]), true
+		}, nil
+	}
+	return func(text string) (string, bool) {
+		idx := strings.Index(text, p.Pattern)
+		if idx < 0 {
+			return "", false
+		}
+		return lineAround(text, idx), true
+	}, nil
+}
+
+// lineAround returns the trimmed line of text containing byte index idx (the
+// wait_for_output result's context line). idx is assumed in range.
+func lineAround(text string, idx int) string {
+	start := strings.LastIndexByte(text[:idx], '\n') + 1 // 0 if none
+	end := idx + strings.IndexByte(text[idx:], '\n')
+	if end < idx { // no trailing newline: run to the end
+		end = len(text)
+	}
+	return strings.TrimSpace(text[start:end])
+}
+
+// Wait-timeout bounds shared by the backend waiter and any client sizing its own
+// round-trip deadline, so both agree on how long a wait can run.
+const (
+	defaultWaitTimeout = 30 * time.Second
+	// MaxWaitTimeout caps a single wait; the ctlproto server sizes its backstop
+	// above this so a waiter always resolves on its own timer first.
+	MaxWaitTimeout = 10 * time.Minute
+)
+
+// WaitTimeout resolves a wait's TimeoutMs into a duration: 0 ⇒ the default, and
+// anything above MaxWaitTimeout is clamped.
+func WaitTimeout(ms uint32) time.Duration {
+	if ms == 0 {
+		return defaultWaitTimeout
+	}
+	if d := time.Duration(ms) * time.Millisecond; d < MaxWaitTimeout {
+		return d
+	}
+	return MaxWaitTimeout
 }
 
 // TabParams: tab.focus.

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rohanthewiz/herdr-web/internal/app"
 	"github.com/rohanthewiz/herdr-web/internal/browserproto"
 	"github.com/rohanthewiz/herdr-web/internal/orchestration"
 	"github.com/rohanthewiz/herdr-web/internal/terminal"
@@ -75,6 +76,7 @@ func (d *daemon) run() {
 		d.setConn(nil)
 		d.o.post(func() {
 			d.o.flushPending("termhost connection lost")
+			d.o.flushWaiters("termhost connection lost")
 			d.o.broadcast(browserproto.NewError(0, "termhost connection lost — reconnecting"))
 		})
 	}
@@ -161,7 +163,11 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 			return
 		}
 		o.post(func() {
-			if o.panes[ev.PaneID] == nil || !o.visible[ev.PaneID] {
+			if o.panes[ev.PaneID] == nil {
+				return
+			}
+			o.triggerWaiterCheck(ev.PaneID) // waiters observe a pane's output even when off-screen
+			if !o.visible[ev.PaneID] {
 				return
 			}
 			for c := range o.conns {
@@ -203,6 +209,7 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 			if o.visible[ev.PaneID] {
 				o.broadcast(browserproto.NewPaneTitle(ev.PaneID, o.effectiveTitle(ev.PaneID)))
 			}
+			o.emitEvent(app.EventPaneTitle, ev.PaneID, app.PaneTitleEvent{Pane: ev.PaneID, Title: ev.Title})
 		})
 
 	case orchestration.MsgPaneCwd:
@@ -219,6 +226,7 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 			if o.visible[ev.PaneID] {
 				o.broadcast(browserproto.NewPaneCwd(ev.PaneID, ev.Cwd))
 			}
+			o.emitEvent(app.EventPaneCwd, ev.PaneID, app.PaneCwdEvent{Pane: ev.PaneID, Cwd: ev.Cwd})
 		})
 
 	case orchestration.MsgPaneAgent:
@@ -236,6 +244,7 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 				o.broadcast(browserproto.NewPaneAgent(ev.PaneID, ev.Agent, ev.State, true))
 			}
 			o.broadcast(o.agentsMsg())
+			o.emitEvent(app.EventPaneAgent, ev.PaneID, app.PaneAgentEvent{Pane: ev.PaneID, Agent: ev.Agent, State: ev.State})
 		})
 
 	case orchestration.MsgPaneClipboard:
@@ -260,6 +269,8 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 			if o.visible[ev.PaneID] {
 				o.broadcast(browserproto.NewPaneExited(ev.PaneID, ev.ExitCode))
 			}
+			o.emitEvent(app.EventPaneExited, ev.PaneID, app.PaneExitedEvent{Pane: ev.PaneID, ExitCode: ev.ExitCode})
+			o.resolveWaitersOnExit(ev.PaneID) // no more output will come
 		})
 
 	case orchestration.MsgPaneSelection:

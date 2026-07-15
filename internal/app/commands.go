@@ -44,6 +44,11 @@ type Backend interface {
 	// reply (or a timeout / disconnect) arrives — the dispatch returns first.
 	StartRead(r Responder, p ReadParams)
 	StartCapture(r Responder, p CaptureParams)
+	// StartWaitForOutput registers a waiter that resolves r when the pane's
+	// captured output matches p (WaitForOutputResult{Matched:true}), or on the
+	// wait's own timeout / pane exit (Matched:false). The dispatch returns first;
+	// the waiter re-scans as the pane produces output.
+	StartWaitForOutput(r Responder, p WaitForOutputParams)
 
 	// ReloadConfig acknowledges a config reload (a no-op today).
 	ReloadConfig() error
@@ -308,6 +313,29 @@ func (d *Dispatcher) Dispatch(name string, dec ParamDecoder, r Responder) {
 			return
 		}
 		d.backend.StartCapture(r, p) // async: the daemon reply resolves r later
+
+	case CmdWaitForOutput:
+		var p WaitForOutputParams
+		if err := dec.Decode(&p); err != nil {
+			bad(err)
+			return
+		}
+		if !r.WantsReply() {
+			return // wait yields only a result; with no reply channel there's nothing to await
+		}
+		if _, err := p.Matcher(); err != nil {
+			r.Fail(err.Error()) // empty pattern / bad regex
+			return
+		}
+		if !d.backend.PaneExists(p.Pane) {
+			r.Fail(fmt.Sprintf("unknown pane %d", p.Pane))
+			return
+		}
+		if !d.backend.DaemonConnected() {
+			r.Fail("termhost daemon not connected")
+			return
+		}
+		d.backend.StartWaitForOutput(r, p) // async: a match / timeout / exit resolves r later
 
 	case CmdTabCreate:
 		if _, err := d.session.CreateTab(); err != nil {

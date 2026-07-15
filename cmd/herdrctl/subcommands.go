@@ -48,6 +48,7 @@ var subcommands = []subcommand{
 	{"tabs", app.CmdTabList, "tabs [workspace]", "list tabs (active workspace by default)", buildTabList},
 	{"panes", app.CmdPaneList, "panes", "list all panes", noParams},
 	{"pane", app.CmdPaneGet, "pane [pane]", "describe one pane (focused by default)", buildOptPane},
+	{"events", ctlproto.MethodEventsSubscribe, "events [pane]", "stream pane events until interrupted (Ctrl-C)", buildEvents},
 
 	// Pane commands.
 	{"split", app.CmdPaneSplit, "split [h|v] [pane]", "split a pane (h by default)", buildSplit},
@@ -63,6 +64,7 @@ var subcommands = []subcommand{
 	{"scroll", app.CmdScroll, "scroll <pane> <delta>", "scroll a pane by delta lines (negative = up)", buildScroll},
 	{"capture", app.CmdCapture, "capture <pane> [lines]", "capture a pane's text (whole buffer, or last N lines)", buildCapture},
 	{"read", app.CmdRead, "read <pane> <r0> <c0> <r1> <c1>", "read the text between two [row,col] points", buildRead},
+	{"wait", app.CmdWaitForOutput, "wait <pane> <pattern> [timeout_secs]", "wait until a pane's output contains a pattern", buildWait},
 
 	// Tab commands.
 	{"tab", app.CmdTabFocus, "tab <num>", "focus a tab", buildTabFocus},
@@ -255,6 +257,44 @@ func buildRead(args []string) (json.RawMessage, error) {
 		Anchor: [2]uint32{nums[1], nums[2]},
 		Cursor: [2]uint32{nums[3], nums[4]},
 	})
+}
+
+// buildWait: wait <pane> <pattern> [timeout_secs]. The pattern is a plain
+// substring; the raw path (pane.wait_for_output --params) reaches regex/lines.
+// timeout_secs accepts fractions (e.g. 0.5); omitted uses the server default.
+func buildWait(args []string) (json.RawMessage, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return nil, usageErr{"wait <pane> <pattern> [timeout_secs]"}
+	}
+	pane, err := parsePane(args[0])
+	if err != nil {
+		return nil, err
+	}
+	p := app.WaitForOutputParams{Pane: pane, Pattern: args[1]}
+	if len(args) == 3 {
+		secs, err := strconv.ParseFloat(args[2], 64)
+		if err != nil || secs < 0 {
+			return nil, fmt.Errorf("timeout %q is not a non-negative number of seconds", args[2])
+		}
+		p.TimeoutMs = uint32(secs * 1000)
+	}
+	return marshal(p)
+}
+
+// buildEvents: events [pane] — an optional pane filter for the event stream. The
+// raw path reaches the events filter (`events.subscribe --params '{"events":[…]}'`).
+func buildEvents(args []string) (json.RawMessage, error) {
+	if len(args) > 1 {
+		return nil, usageErr{"events [pane]"}
+	}
+	if len(args) == 0 {
+		return nil, nil
+	}
+	pane, err := parsePane(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return marshal(app.EventsSubscribeParams{Pane: &pane})
 }
 
 // buildTabFocus: tab <num>.

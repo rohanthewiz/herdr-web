@@ -131,6 +131,26 @@ func TestBuildCapture(t *testing.T) {
 	buildErr(t, "capture", []string{"1", "lots"})
 }
 
+// wait: pane + pattern required; an optional fractional timeout becomes ms.
+func TestBuildWait(t *testing.T) {
+	buildOK(t, "wait", []string{"1", "ready"}, app.WaitForOutputParams{Pane: 1, Pattern: "ready"})
+	buildOK(t, "wait", []string{"2", "BUILD DONE", "30"},
+		app.WaitForOutputParams{Pane: 2, Pattern: "BUILD DONE", TimeoutMs: 30000})
+	buildOK(t, "wait", []string{"1", "x", "0.5"},
+		app.WaitForOutputParams{Pane: 1, Pattern: "x", TimeoutMs: 500})
+	buildErr(t, "wait", []string{"1"})              // pattern required
+	buildErr(t, "wait", []string{"1", "x", "soon"}) // non-numeric timeout
+	buildErr(t, "wait", []string{"1", "x", "2", "3"})
+}
+
+// events: optional pane filter.
+func TestBuildEvents(t *testing.T) {
+	buildOK(t, "events", nil, app.EventsSubscribeParams{})
+	buildOK(t, "events", []string{"3"}, app.EventsSubscribeParams{Pane: u32(3)})
+	buildErr(t, "events", []string{"1", "2"})
+	buildErr(t, "events", []string{"notapane"})
+}
+
 // tab.list / tab operands.
 func TestBuildTabs(t *testing.T) {
 	buildOK(t, "tabs", nil, app.TabListParams{})
@@ -169,7 +189,8 @@ func TestSubcommandRegistryIntegrity(t *testing.T) {
 		if sc.build == nil {
 			t.Errorf("verb %q has no builder", sc.verb)
 		}
-		if sc.method != ctlproto.MethodPing && !slices.Contains(names, sc.method) {
+		if sc.method != ctlproto.MethodPing && sc.method != ctlproto.MethodEventsSubscribe &&
+			!slices.Contains(names, sc.method) {
 			t.Errorf("verb %q maps to unknown method %q", sc.verb, sc.method)
 		}
 		if sc.synopsis == "" || sc.summary == "" {

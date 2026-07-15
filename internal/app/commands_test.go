@@ -30,6 +30,8 @@ type fakeBackend struct {
 	reloadErr   error
 	lastRead    Responder
 	lastCapture Responder
+	lastWait    Responder
+	lastWaitP   WaitForOutputParams
 	lastScroll  [2]int
 	lastTitle   uint32
 }
@@ -53,6 +55,11 @@ func (b *fakeBackend) StartRead(r Responder, _ ReadParams) { b.rec("startRead");
 func (b *fakeBackend) StartCapture(r Responder, _ CaptureParams) {
 	b.rec("startCapture")
 	b.lastCapture = r
+}
+func (b *fakeBackend) StartWaitForOutput(r Responder, p WaitForOutputParams) {
+	b.rec("startWait")
+	b.lastWait = r
+	b.lastWaitP = p
 }
 
 // fakeResponder records the terminal reply (and its data), writing "ok"/"fail" to
@@ -350,6 +357,113 @@ func TestCommandNamesAllRouted(t *testing.T) {
 		if r.failCall && strings.Contains(r.errMsg, unknown) {
 			t.Errorf("command %q is enumerated but not routed by Dispatch (%q)", name, r.errMsg)
 		}
+	}
+}
+
+// --- pane.wait_for_output ----------------------------------------------------
+
+// With no reply channel a wait yields nothing to await, so it short-circuits
+// before registering a waiter (no backend effect, no reply).
+func TestDispatchWaitNoReply(t *testing.T) {
+	h := newCmdHarness(t)
+	r := &fakeResponder{log: h.log, wants: false}
+	h.d.Dispatch(CmdWaitForOutput, params(t, WaitForOutputParams{Pane: 1, Pattern: "x"}), r)
+	if r.okCall || r.failCall {
+		t.Fatalf("no-reply wait should not resolve: ok=%v fail=%v", r.okCall, r.failCall)
+	}
+	if len(*h.log) != 0 {
+		t.Fatalf("no-reply wait should not start a waiter: log=%v", *h.log)
+	}
+}
+
+// An empty pattern / bad regex is rejected as bad params before a waiter starts.
+func TestDispatchWaitBadPattern(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    WaitForOutputParams
+		want string
+	}{
+		{"empty", WaitForOutputParams{Pane: 1}, "empty pattern"},
+		{"badRegex", WaitForOutputParams{Pane: 1, Pattern: "(", Regex: true}, "bad regex"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCmdHarness(t)
+			r := h.resp()
+			h.d.Dispatch(CmdWaitForOutput, params(t, tc.p), r)
+			if !r.failCall || !strings.Contains(r.errMsg, tc.want) {
+				t.Fatalf("fail=%v msg=%q, want %q", r.failCall, r.errMsg, tc.want)
+			}
+			if h.b.lastWait != nil {
+				t.Fatalf("bad pattern should not start a waiter")
+			}
+		})
+	}
+}
+
+// The daemon-round-trip gates (unknown pane, daemon down) fail before starting.
+func TestDispatchWaitGated(t *testing.T) {
+	unknown := newCmdHarness(t)
+	unknown.b.paneExists = false
+	r := unknown.resp()
+	unknown.d.Dispatch(CmdWaitForOutput, params(t, WaitForOutputParams{Pane: 9, Pattern: "x"}), r)
+	if !r.failCall || !strings.Contains(r.errMsg, "unknown pane") {
+		t.Fatalf("unknown pane: fail=%v msg=%q", r.failCall, r.errMsg)
+	}
+
+	down := newCmdHarness(t)
+	down.b.daemonUp = false
+	r = down.resp()
+	down.d.Dispatch(CmdWaitForOutput, params(t, WaitForOutputParams{Pane: 1, Pattern: "x"}), r)
+	if !r.failCall || !strings.Contains(r.errMsg, "not connected") {
+		t.Fatalf("daemon down: fail=%v msg=%q", r.failCall, r.errMsg)
+	}
+}
+
+// A valid wait registers with the backend and does not resolve synchronously; the
+// params are forwarded intact.
+func TestDispatchWaitStarts(t *testing.T) {
+	h := newCmdHarness(t)
+	r := h.resp()
+	p := WaitForOutputParams{Pane: 1, Pattern: "ready", TimeoutMs: 5000}
+	h.d.Dispatch(CmdWaitForOutput, params(t, p), r)
+	if r.okCall || r.failCall {
+		t.Fatalf("wait should not resolve synchronously: ok=%v fail=%v", r.okCall, r.failCall)
+	}
+	if len(*h.log) != 1 || (*h.log)[0] != "startWait" {
+		t.Fatalf("expected a single startWait, log=%v", *h.log)
+	}
+	if h.b.lastWait != r || h.b.lastWaitP != p {
+		t.Fatalf("wait not forwarded: resp=%v params=%+v", h.b.lastWait == r, h.b.lastWaitP)
+	}
+}
+
+// Matcher compiles a substring or regex predicate, returns the matched line for
+// context, and validates the pattern.
+func TestWaitForOutputMatcher(t *testing.T) {
+	sub, err := WaitForOutputParams{Pattern: "DONE"}.Matcher()
+	if err != nil {
+		t.Fatalf("substring matcher: %v", err)
+	}
+	if line, ok := sub("building\n  all DONE here  \nnext"); !ok || line != "all DONE here" {
+		t.Fatalf("substring match: line=%q ok=%v", line, ok)
+	}
+	if _, ok := sub("nothing to see"); ok {
+		t.Fatalf("substring should not match")
+	}
+
+	re, err := WaitForOutputParams{Pattern: `exit code \d+`, Regex: true}.Matcher()
+	if err != nil {
+		t.Fatalf("regex matcher: %v", err)
+	}
+	if line, ok := re("run\nexit code 42\n"); !ok || line != "exit code 42" {
+		t.Fatalf("regex match: line=%q ok=%v", line, ok)
+	}
+
+	if _, err := (WaitForOutputParams{}).Matcher(); err == nil {
+		t.Fatalf("empty pattern should error")
+	}
+	if _, err := (WaitForOutputParams{Pattern: "(", Regex: true}).Matcher(); err == nil {
+		t.Fatalf("bad regex should error")
 	}
 }
 
