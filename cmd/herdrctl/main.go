@@ -6,21 +6,28 @@
 //
 // Usage:
 //
-//	herdrctl [flags] <method> [--params '<json>']
-//	herdrctl [flags] ping
-//	herdrctl commands
+//	herdrctl [flags] <verb> [args...]           ergonomic subcommand
+//	herdrctl [flags] <method> [--params '<json>']  raw §7 command (escape hatch)
+//	herdrctl help                               list the ergonomic verbs
+//	herdrctl commands                           list the raw §7 method names
 //
-// <method> is any §7 command name (`herdrctl commands` lists them). Examples:
+// Ergonomic verbs build the params for you from positional args (`herdrctl help`
+// lists them). Examples:
 //
-//	herdrctl pane.split --params '{"direction":"h"}'
-//	herdrctl pane.focus --params '{"pane":1}'
-//	herdrctl read       --params '{"pane":1,"anchor":[0,0],"cursor":[0,5]}'
-//	herdrctl capture    --params '{"pane":1,"scope":1,"lines":100}'
-//	herdrctl tab.create
-//	herdrctl server.stop
+//	herdrctl split h 2      → pane.split {"direction":"h","pane":2}
+//	herdrctl focus 1        → pane.focus {"pane":1}
+//	herdrctl panes          → pane.list
+//	herdrctl new-tab        → tab.create
+//	herdrctl stop           → server.stop
 //
-// Flags may appear before or after the method. Exit status: 0 on success, 1 if
-// the command failed, 2 on a usage/transport error.
+// The raw form reaches any §7 command directly (and the rarely-scripted options
+// like read's rect or capture's ansi/unwrap that the ergonomic verbs omit):
+//
+//	herdrctl read    --params '{"pane":1,"anchor":[0,0],"cursor":[0,5],"rect":true}'
+//	herdrctl capture --params '{"pane":1,"scope":1,"lines":100,"ansi":true}'
+//
+// Global flags go before the verb (e.g. `herdrctl --socket … split h`). Exit
+// status: 0 on success, 1 if the command failed, 2 on a usage/transport error.
 package main
 
 import (
@@ -57,32 +64,53 @@ func run() int {
 	}
 	method := rest[0]
 	_ = flag.CommandLine.Parse(rest[1:])
-	if extra := flag.Args(); len(extra) > 0 {
-		fmt.Fprintf(os.Stderr, "herdrctl: unexpected extra arguments: %v\n", extra)
-		return 2
-	}
+	pos := flag.Args() // positional args after the verb (an ergonomic verb's operands)
 
-	if method == "commands" {
+	switch method {
+	case "help", "-h", "--help":
+		usage()
+		return 0
+	case "commands":
 		for _, n := range app.CommandNames() {
 			fmt.Println(n)
 		}
 		return 0
 	}
 
-	// Validate the method locally so a typo lists the vocabulary instead of a
-	// round trip to the server's "not supported yet" default.
-	if method != ctlproto.MethodPing && !slices.Contains(app.CommandNames(), method) {
-		fmt.Fprintf(os.Stderr, "herdrctl: unknown command %q (try `herdrctl commands`)\n", method)
-		return 2
-	}
-
+	// Resolve the verb: an ergonomic subcommand (which builds the params from
+	// positional args) takes precedence; otherwise the raw `<method> --params`
+	// path — the full-coverage escape hatch — carries the request through.
 	var params json.RawMessage
-	if *paramsJSON != "" {
-		if !json.Valid([]byte(*paramsJSON)) {
-			fmt.Fprintln(os.Stderr, "herdrctl: --params is not valid JSON")
+	if sc, ok := lookupSubcommand(method); ok {
+		if *paramsJSON != "" {
+			fmt.Fprintf(os.Stderr, "herdrctl: %s takes positional arguments, not --params\n", method)
 			return 2
 		}
-		params = json.RawMessage(*paramsJSON)
+		built, err := sc.build(pos)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herdrctl: %v\n", err)
+			return 2
+		}
+		method = sc.method
+		params = built
+	} else {
+		// Validate the method locally so a typo lists the vocabulary instead of a
+		// round trip to the server's "not supported yet" default.
+		if method != ctlproto.MethodPing && !slices.Contains(app.CommandNames(), method) {
+			fmt.Fprintf(os.Stderr, "herdrctl: unknown command %q (try `herdrctl help`)\n", method)
+			return 2
+		}
+		if len(pos) > 0 {
+			fmt.Fprintf(os.Stderr, "herdrctl: unexpected extra arguments: %v\n", pos)
+			return 2
+		}
+		if *paramsJSON != "" {
+			if !json.Valid([]byte(*paramsJSON)) {
+				fmt.Fprintln(os.Stderr, "herdrctl: --params is not valid JSON")
+				return 2
+			}
+			params = json.RawMessage(*paramsJSON)
+		}
 	}
 
 	resp, err := ctlproto.Call(ctlproto.ResolveSocket(*socket),
@@ -127,18 +155,15 @@ func usage() {
 	fmt.Fprint(os.Stderr, `herdrctl — local control-API client for a running herdr server (cmd/gateway2)
 
 Usage:
-  herdrctl [flags] <method> [--params '<json>']
-  herdrctl [flags] ping
-  herdrctl commands
+  herdrctl [flags] <verb> [args...]            ergonomic subcommand
+  herdrctl [flags] <method> [--params '<json>']   raw §7 command (escape hatch)
+  herdrctl commands                            list the raw §7 method names
 
-Examples:
-  herdrctl pane.split --params '{"direction":"h"}'
-  herdrctl pane.focus --params '{"pane":1}'
-  herdrctl read       --params '{"pane":1,"anchor":[0,0],"cursor":[0,5]}'
-  herdrctl tab.create
-  herdrctl server.stop
-
-Flags:
+Verbs:
+`)
+	fmt.Fprint(os.Stderr, subcommandsHelp())
+	fmt.Fprint(os.Stderr, `
+Global flags (place before the verb):
 `)
 	flag.PrintDefaults()
 }
