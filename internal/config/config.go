@@ -35,6 +35,7 @@ const EnvVar = "HERDR_CONFIG"
 // Config is the whole gateway2 configuration file.
 type Config struct {
 	Server      Server      `yaml:"server"`
+	Persistence Persistence `yaml:"persistence"`
 	Theme       Theme       `yaml:"theme"`
 	Keybindings Keybindings `yaml:"keybindings"`
 }
@@ -49,6 +50,21 @@ type Server struct {
 	Auth           string `yaml:"auth"`           // "password" | "none"
 	SessionTTL     string `yaml:"session_ttl"`    // a Go duration string, e.g. "24h"
 	TLS            TLS    `yaml:"tls"`
+}
+
+// Persistence is session persistence & restore (WS3): the model snapshot that
+// survives a gateway restart and the scrollback seeds that survive a termhost
+// daemon loss.
+type Persistence struct {
+	// Enabled turns persistence on (the default): the session model is saved on
+	// every mutation and restored at startup.
+	Enabled bool `yaml:"enabled"`
+	// StateDir overrides where session.json/history.json live ("" ⇒
+	// $XDG_STATE_HOME/herdr, falling back to ~/.local/state/herdr).
+	StateDir string `yaml:"state_dir"`
+	// HistoryLines bounds the scrollback captured per pane for cold-restore
+	// seeds (0 = the whole buffer).
+	HistoryLines int `yaml:"history_lines"`
 }
 
 // TLS is the HTTPS configuration. Enabled alone uses an auto self-signed cert;
@@ -124,6 +140,7 @@ func Default() Config {
 			Auth:           "password",
 			SessionTTL:     "24h",
 		},
+		Persistence: Persistence{Enabled: true, HistoryLines: 2000},
 		Theme:       Theme{Colors: cloneStrMap(defaultColors), Font: defaultFont},
 		Keybindings: Keybindings{CopyMode: cloneKeyMap(defaultCopyMode)},
 	}
@@ -192,6 +209,9 @@ func (c Config) Validate() error {
 	}
 	if (c.Server.TLS.Cert == "") != (c.Server.TLS.Key == "") {
 		return errors.New("server.tls: cert and key must be set together")
+	}
+	if c.Persistence.HistoryLines < 0 {
+		return fmt.Errorf("persistence.history_lines %d: must be >= 0", c.Persistence.HistoryLines)
 	}
 	for action, keys := range c.Keybindings.CopyMode {
 		if _, ok := defaultCopyMode[action]; !ok {

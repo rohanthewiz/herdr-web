@@ -137,6 +137,12 @@ func (d *daemon) reconcile(alivePanes []uint32) {
 				continue // syncDaemon (in applyModel) creates missing runtimes
 			}
 			rt.created = alive[pid]
+			if alive[pid] {
+				// An adopted survivor keeps its live PTY, real scrollback, and
+				// real cwd — the restored seeds would be stale duplicates.
+				delete(o.seeds, pid)
+				delete(o.restoredCwds, pid)
+			}
 		}
 		for _, id := range alivePanes {
 			if !model[id] {
@@ -163,9 +169,11 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 			return
 		}
 		o.post(func() {
-			if o.panes[ev.PaneID] == nil {
+			rt := o.panes[ev.PaneID]
+			if rt == nil {
 				return
 			}
+			rt.histDirty = true // output since the last history capture (WS3)
 			if !o.visible[ev.PaneID] {
 				return
 			}
@@ -235,6 +243,7 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 				o.broadcast(browserproto.NewPaneCwd(ev.PaneID, ev.Cwd))
 			}
 			o.emitEvent(app.EventPaneCwd, ev.PaneID, app.PaneCwdEvent{Pane: ev.PaneID, Cwd: ev.Cwd})
+			o.saveSoon() // pane cwds ride the session file (restore re-spawns there)
 		})
 
 	case orchestration.MsgPaneAgent:

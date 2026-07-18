@@ -135,3 +135,27 @@ func TestLoad(t *testing.T) {
 		t.Fatalf("Load via env: addr=%q err=%v", got.Server.Addr, err)
 	}
 }
+
+// The persistence block: absent keys keep the on-by-default behaviour; present
+// keys override; a negative history_lines is rejected.
+func TestParsePersistence(t *testing.T) {
+	got, err := parse([]byte("persistence:\n  state_dir: /tmp/state\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !got.Persistence.Enabled || got.Persistence.StateDir != "/tmp/state" || got.Persistence.HistoryLines != 2000 {
+		t.Fatalf("got %+v", got.Persistence)
+	}
+
+	got, err = parse([]byte("persistence:\n  enabled: false\n  history_lines: 500\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.Persistence.Enabled || got.Persistence.HistoryLines != 500 {
+		t.Fatalf("got %+v", got.Persistence)
+	}
+
+	if _, err := parse([]byte("persistence:\n  history_lines: -1\n")); err == nil {
+		t.Fatal("negative history_lines should be rejected")
+	}
+}

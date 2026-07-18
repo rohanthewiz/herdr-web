@@ -32,24 +32,38 @@
 //	gateway2 [--addr :8421] [--socket /tmp/herdr-termhost.sock] \
 //	         [--control-socket /tmp/herdr-control.sock] \
 //	         [--auth password|none] [--password SECRET] [--session-ttl 24h] \
-//	         [--tls] [--tls-cert cert.pem] [--tls-key key.pem]
+//	         [--tls] [--tls-cert cert.pem] [--tls-key key.pem] \
+//	         [--persist=false] [--state-dir DIR]
+//
+// Session persistence (WS3) is on by default: the workspace/tab/pane model is
+// saved to $XDG_STATE_HOME/herdr (default ~/.local/state/herdr) on every
+// mutation and restored at startup — surviving PTYs are re-adopted from the
+// persistent daemon, dead ones re-spawned with their captured scrollback
+// replayed.
 package main
 
 import (
 	"embed"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
+	"maps"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/rohanthewiz/rweb"
 
+	"github.com/rohanthewiz/herdr-web/internal/app"
 	"github.com/rohanthewiz/herdr-web/internal/config"
 	"github.com/rohanthewiz/herdr-web/internal/ctlproto"
 	"github.com/rohanthewiz/herdr-web/internal/gwauth"
 	"github.com/rohanthewiz/herdr-web/internal/gwtls"
+	"github.com/rohanthewiz/herdr-web/internal/persist"
 )
 
 //go:embed web/index.html
@@ -68,6 +82,8 @@ func main() {
 	useTLS := flag.Bool("tls", false, "serve HTTPS (auto self-signed cert unless --tls-cert/--tls-key given)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate PEM (implies --tls)")
 	tlsKey := flag.String("tls-key", "", "TLS private key PEM (implies --tls)")
+	persistOn := flag.Bool("persist", true, "persist and restore session state (WS3)")
+	stateDir := flag.String("state-dir", "", "session state directory (default $XDG_STATE_HOME/herdr)")
 	flag.Parse()
 
 	// Config precedence for server settings is flag > config file > default.
@@ -109,6 +125,13 @@ func main() {
 	if set["tls-key"] {
 		eff.TLS.Key = *tlsKey
 	}
+	effPersist := cfg.Persistence
+	if set["persist"] {
+		effPersist.Enabled = *persistOn
+	}
+	if set["state-dir"] {
+		effPersist.StateDir = *stateDir
+	}
 
 	indexHTML, err := webFS.ReadFile("web/index.html")
 	if err != nil {
@@ -116,7 +139,7 @@ func main() {
 	}
 
 	cwd, _ := os.Getwd()
-	o, err := newOrch(eff.TermhostSocket, cwd)
+	o, err := buildOrch(eff.TermhostSocket, cwd, effPersist)
 	if err != nil {
 		log.Fatalf("gateway2: %v", err)
 	}
@@ -139,17 +162,34 @@ func main() {
 		controlCleanup = func() {}
 	}
 
-	// server.stop hook: rweb has no graceful shutdown, so exit the process after
-	// a short grace period that lets the final cmd_result + shutdown broadcast
-	// flush to browsers. The persistent termhost daemon is separate and survives.
+	// Process-exit hook, fired by orch.Shutdown (server.stop command or a
+	// SIGINT/SIGTERM) after the state save + final capture: rweb has no graceful
+	// shutdown, so exit after a short grace period that lets the final
+	// cmd_result + shutdown broadcast flush to browsers. The persistent termhost
+	// daemon is separate and survives.
 	o.stop = func() {
-		log.Printf("gateway2: server.stop received — shutting down")
+		log.Printf("gateway2: shutting down — session state saved; termhost daemon survives")
 		controlCleanup()
 		time.AfterFunc(250*time.Millisecond, func() { os.Exit(0) })
 	}
 
+	// A clean quit (Ctrl-C / SIGTERM) routes through the same graceful path as
+	// server.stop: save the model, run the bounded final scrollback capture,
+	// then exit. A second signal force-quits.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigc
+		o.post(func() { o.Shutdown() })
+		<-sigc
+		os.Exit(1)
+	}()
+
 	go o.run()        // the orchestrator event loop (sole state owner)
 	go o.daemon.run() // dial the termhost daemon
+	if o.historyPath != "" {
+		go o.runHistoryCapture() // periodic scrollback sweep for cold-restore seeds
+	}
 
 	// TLS: operator PEMs, or an auto-generated self-signed pair.
 	tlsOn := eff.TLS.Enabled || eff.TLS.Cert != "" || eff.TLS.Key != ""
@@ -186,7 +226,75 @@ func main() {
 		scheme = "https"
 	}
 	log.Printf("gateway2: serving at %s://localhost%s (termhost socket %s)", scheme, eff.Addr, eff.TermhostSocket)
-	log.Fatal(s.Run())
+	if err := s.Run(); err != nil {
+		log.Fatalf("gateway2: %v", err)
+	}
+	// rweb installs its own SIGINT/SIGTERM handler and returns nil from Run on a
+	// signal. The signal goroutine above got the same signal and is driving the
+	// graceful shutdown (save + final capture → os.Exit); block until it does.
+	select {}
+}
+
+// buildOrch constructs the orchestrator, restoring the persisted session when
+// persistence is on and a usable snapshot exists (WS3). Any load/restore
+// problem beyond "no file yet" is logged and falls back to a fresh session —
+// never a dead gateway. Scrollback seeds and saved cwds are installed only
+// when the model itself restored: against a fresh session their pane ids would
+// collide with newly allocated ones.
+func buildOrch(socket, cwd string, pc config.Persistence) (*orch, error) {
+	if !pc.Enabled {
+		return newOrch(socket, cwd)
+	}
+	dir := pc.StateDir
+	if dir == "" {
+		dir = persist.DefaultDir()
+	}
+	if dir == "" {
+		log.Printf("gateway2: persistence disabled — no resolvable state dir")
+		return newOrch(socket, cwd)
+	}
+	sessionPath, historyPath := persist.SessionPath(dir), persist.HistoryPath(dir)
+
+	var sess *app.Session
+	var savedCwds map[uint32]string
+	snap, cwds, err := persist.LoadSession(sessionPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// first run — start fresh, silently
+	case err != nil:
+		log.Printf("gateway2: session state unusable, starting fresh: %v", err)
+	default:
+		if sess, err = app.RestoreSession(modelSpawner{}, snap); err != nil {
+			log.Printf("gateway2: session restore failed, starting fresh: %v", err)
+			sess = nil
+		} else {
+			savedCwds = cwds
+			total := len(snap.Workspaces)
+			log.Printf("gateway2: restored session from %s (%d workspaces, %d panes)",
+				sessionPath, total, len(sess.AllPaneIDs()))
+		}
+	}
+	if sess == nil {
+		o, err := newOrch(socket, cwd)
+		if err != nil {
+			return nil, err
+		}
+		o.sessionPath, o.historyPath = sessionPath, historyPath
+		o.histLines = uint32(pc.HistoryLines)
+		return o, nil
+	}
+
+	o := newOrchWith(socket, cwd, sess)
+	o.sessionPath, o.historyPath = sessionPath, historyPath
+	o.histLines = uint32(pc.HistoryLines)
+	o.restoredCwds = savedCwds
+	if seeds, err := persist.LoadHistory(historyPath); err == nil {
+		o.seeds = seeds
+		o.capturedHist = maps.Clone(seeds) // partial sweeps must not wipe other panes' seeds
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		log.Printf("gateway2: history state unusable, skipping scrollback seeds: %v", err)
+	}
+	return o, nil
 }
 
 // buildGuard constructs the auth guard for the chosen mode. "none" returns a

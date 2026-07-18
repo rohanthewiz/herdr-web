@@ -46,6 +46,10 @@ type paneRuntime struct {
 	// created reports whether the daemon holds this pane's PTY. reconcile
 	// resets it from the daemon's surviving-pane set on every (re)connect.
 	created bool
+	// histDirty marks output since the last history capture (WS3): the periodic
+	// sweep only captures panes whose content actually changed. Set on every
+	// pane_frame, cleared when a capture is issued.
+	histDirty bool
 }
 
 // orch is the WS2 orchestrator: a single event-loop actor (run) that owns all
@@ -102,6 +106,27 @@ type orch struct {
 	baseHTML []byte
 	cfgPath  string
 	page     atomic.Pointer[[]byte]
+	// --- session persistence (WS3), wired by main; zero values disable it ---
+	// sessionPath/historyPath are the state files ("" ⇒ persistence off). seeds
+	// and restoredCwds are loaded at startup and consumed by createPane for
+	// panes the daemon no longer holds (cold start): the seed replays saved
+	// scrollback via create_pane.initial_history, the cwd re-spawns the shell
+	// where it was. capturedHist accumulates the latest ANSI capture per pane —
+	// initialized from the loaded seeds so a partial capture sweep never wipes
+	// another pane's seed from disk. saveArmed/histArmed debounce the writes.
+	// histLines bounds each capture (0 = whole buffer). All loop-goroutine only.
+	sessionPath  string
+	historyPath  string
+	seeds        map[uint32]string
+	restoredCwds map[uint32]string
+	capturedHist map[uint32]string
+	histLines    uint32
+	saveArmed    bool
+	histArmed    bool
+	// finalCap tracks the clean-shutdown capture sweep (nil when not shutting
+	// down): Shutdown captures every live pane's scrollback, bounded by a short
+	// deadline, before firing the stop hook.
+	finalCap *finalCapture
 }
 
 // reqKind distinguishes the two §7 commands that need a daemon round-trip: read
@@ -158,32 +183,41 @@ func (modelSpawner) Despawn(workspace.TerminalID) {}
 // newOrch builds the orchestrator with a fresh session (one workspace, one tab,
 // one pane). Splits, tabs, and workspaces are created at runtime via commands.
 func newOrch(socket, cwd string) (*orch, error) {
-	o := &orch{
-		panes:       make(map[uint32]*paneRuntime),
-		conns:       make(map[*client]struct{}),
-		area:        defaultArea,
-		cellW:       8,
-		cellH:       16,
-		cwd:         cwd,
-		visible:     make(map[uint32]bool),
-		pendingReqs: make(map[reqKey][]*pending),
-		waiters:     make(map[uint32][]*waiter),
-		waiterCheck: make(map[uint32]bool),
-		outAccum:    make(map[uint32]*outputScanner),
-		subs:        make(map[*ctlSubscriber]struct{}),
-		mailbox:     make(chan func(), 256),
-	}
-	o.daemon = &daemon{o: o, socket: socket}
-
 	sess, err := app.NewSession(modelSpawner{}, cwd)
 	if err != nil {
 		return nil, err
 	}
-	o.session = sess
+	return newOrchWith(socket, cwd, sess), nil
+}
+
+// newOrchWith builds the orchestrator around an existing session — fresh
+// (newOrch) or restored from a snapshot (WS3; main falls back to fresh when
+// there is nothing to restore).
+func newOrchWith(socket, cwd string, sess *app.Session) *orch {
+	o := &orch{
+		session:      sess,
+		panes:        make(map[uint32]*paneRuntime),
+		conns:        make(map[*client]struct{}),
+		area:         defaultArea,
+		cellW:        8,
+		cellH:        16,
+		cwd:          cwd,
+		visible:      make(map[uint32]bool),
+		pendingReqs:  make(map[reqKey][]*pending),
+		waiters:      make(map[uint32][]*waiter),
+		waiterCheck:  make(map[uint32]bool),
+		outAccum:     make(map[uint32]*outputScanner),
+		subs:         make(map[*ctlSubscriber]struct{}),
+		seeds:        make(map[uint32]string),
+		restoredCwds: make(map[uint32]string),
+		capturedHist: make(map[uint32]string),
+		mailbox:      make(chan func(), 256),
+	}
+	o.daemon = &daemon{o: o, socket: socket}
 	o.syncDaemon()      // desired sizes; no daemon/conns yet, sends are dropped
 	o.refreshViewport() // seed the visible set
 	o.seedStructure()   // snapshot the initial pane set/focus (no retroactive events)
-	return o, nil
+	return o
 }
 
 // run is the event loop: the sole owner of orch state. Every state mutation
@@ -298,11 +332,25 @@ func (o *orch) syncDaemon() {
 	}
 }
 
-// createPane spawns a pane's PTY at its desired grid and marks it created.
+// createPane spawns a pane's PTY at its desired grid and marks it created. A
+// restored pane the daemon no longer holds (cold start) is re-spawned in its
+// saved cwd with its saved scrollback replayed via initial_history (WS3); both
+// are consumed only on a connected send — a pre-connection create is dropped by
+// daemon.send and retried by reconcile, which must still find them.
 func (o *orch) createPane(rt *paneRuntime) {
 	cp := orchestration.NewCreatePane(rt.id, rt.cols, rt.rows)
 	cp.Cwd = o.cwd
 	cp.CellWidthPx, cp.CellHeightPx = o.cellW, o.cellH
+	if o.daemon.connected() {
+		if cwd, ok := o.restoredCwds[rt.id]; ok {
+			cp.Cwd = cwd
+			delete(o.restoredCwds, rt.id)
+		}
+		if h, ok := o.seeds[rt.id]; ok {
+			cp.InitialHistory = h
+			delete(o.seeds, rt.id)
+		}
+	}
 	o.daemon.send(cp)
 	rt.created = true
 }
@@ -325,7 +373,8 @@ func (o *orch) refreshViewport() (added []uint32) {
 
 // applyModel is the standard follow-up after a model-mutating command: sync the
 // daemon, recompute the viewport, broadcast the new layout + agents, refresh any
-// newly-visible panes (chrome + full frame), and emit any structural events.
+// newly-visible panes (chrome + full frame), emit any structural events, and
+// arm the debounced session save.
 func (o *orch) applyModel() {
 	o.syncDaemon()
 	added := o.refreshViewport()
@@ -336,6 +385,7 @@ func (o *orch) applyModel() {
 		o.resyncPane(pid)
 	}
 	o.emitStructuralEvents()
+	o.saveSoon()
 }
 
 // resyncPane forces every connection's translator for the pane to emit a full
@@ -755,18 +805,22 @@ func (o *orch) ApplyModel() { o.applyModel() }
 
 // BroadcastLayout rebroadcasts just the viewport layout (focus/rename moved) and
 // emits any structural event — a focus_changed for the focus commands that route
-// here without touching the pane set (rename is a no-op diff).
+// here without touching the pane set (rename is a no-op diff). Focus and names
+// are durable state, so the debounced save is armed too.
 func (o *orch) BroadcastLayout() {
 	o.broadcast(o.viewportLayout())
 	o.emitStructuralEvents()
+	o.saveSoon()
 }
 
 // BroadcastPaneTitle pushes a pane's effective title if it is on screen; else it
-// rides the chrome resend when the pane next becomes visible.
+// rides the chrome resend when the pane next becomes visible. The custom name it
+// reflects (pane.rename) is durable, so the save is armed.
 func (o *orch) BroadcastPaneTitle(pane uint32) {
 	if o.visible[pane] {
 		o.broadcast(browserproto.NewPaneTitle(pane, o.effectiveTitle(pane)))
 	}
+	o.saveSoon()
 }
 
 // ScrollPane passes a scrollback delta to the pane's PTY.
@@ -805,14 +859,18 @@ func (o *orch) ReloadConfig() error {
 	return nil
 }
 
-// Shutdown tells every browser we are going away, then fires the process-exit
-// hook (set by main). The persistent termhost daemon is a separate process and
-// deliberately survives.
+// Shutdown tells every browser we are going away, saves the session state, and
+// — after a short, bounded final scrollback capture (WS3) — fires the
+// process-exit hook (set by main). The persistent termhost daemon is a separate
+// process and deliberately survives.
 func (o *orch) Shutdown() {
 	o.broadcast(browserproto.NewShutdown())
-	if o.stop != nil {
-		o.stop()
-	}
+	o.saveNow()
+	o.beginFinalCapture(func() {
+		if o.stop != nil {
+			o.stop()
+		}
+	})
 }
 
 // --- Broadcasting ------------------------------------------------------------
