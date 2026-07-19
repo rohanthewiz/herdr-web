@@ -1,42 +1,32 @@
-// Command smoke connects to a running herdr server's client socket, performs
-// the Hello handshake, reads a few semantic frames, and prints a summary. It
-// sends no input and Detaches cleanly, so it is safe against a live session.
-//
-// Usage:
-//
-//	smoke --socket /path/to/herdr-client.sock [--cols 120 --rows 32 --frames 3]
+// The `wire` subcommand (formerly cmd/smoke) connects to a running herdr
+// server's client socket, performs the Hello handshake, reads a few semantic
+// frames, and prints a summary. It sends no input and Detaches cleanly, so it
+// is safe against a live session.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/rohanthewiz/herdr-web/internal/wire"
 )
 
-func main() {
-	socket := flag.String("socket", "", "path to herdr-client.sock")
-	cols := flag.Int("cols", 120, "terminal columns to request")
-	rows := flag.Int("rows", 32, "terminal rows to request")
-	frames := flag.Int("frames", 3, "number of frames to read before detaching")
-	flag.Parse()
-
-	if *socket == "" {
-		fmt.Fprintln(os.Stderr, "error: --socket is required")
-		os.Exit(2)
+func runWireCmd(args []string) error {
+	fs := flag.NewFlagSet("probe wire", flag.ExitOnError)
+	socket := fs.String("socket", defaultSocket(), "path to herdr-client.sock")
+	cols := fs.Int("cols", 120, "terminal columns to request")
+	rows := fs.Int("rows", 32, "terminal rows to request")
+	frames := fs.Int("frames", 3, "number of frames to read before detaching")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-
-	if err := run(*socket, uint16(*cols), uint16(*rows), *frames); err != nil {
-		fmt.Fprintf(os.Stderr, "smoke: %v\n", err)
-		os.Exit(1)
-	}
+	return runWire(*socket, uint16(*cols), uint16(*rows), *frames)
 }
 
-func run(socket string, cols, rows uint16, wantFrames int) error {
+func runWire(socket string, cols, rows uint16, wantFrames int) error {
 	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", socket, err)

@@ -1,8 +1,7 @@
-// Command wsprobe is a stdlib-only WebSocket client used to verify the gateway
-// end-to-end without a browser: it connects to /ws, sends the init message, and
-// prints a summary of the first frame(s) the gateway streams back.
-//
-// Usage: wsprobe [--url ws://localhost:8420/ws] [--cols 120 --rows 32 --msgs 8]
+// The `ws` subcommand (formerly cmd/wsprobe) is a stdlib-only WebSocket client
+// used to verify the gateway end-to-end without a browser: it connects to /ws,
+// sends the init message, and prints a summary of the first frame(s) the
+// gateway streams back.
 package main
 
 import (
@@ -16,26 +15,24 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 )
 
-func main() {
-	rawURL := flag.String("url", "ws://localhost:8420/ws", "gateway WebSocket URL")
-	cols := flag.Int("cols", 120, "columns")
-	rows := flag.Int("rows", 32, "rows")
-	msgs := flag.Int("msgs", 8, "total server messages to read")
-	sendInput := flag.Bool("send-input", false, "also exercise the browser→herdr input path (sends Ctrl-L; do NOT use against a live session)")
-	flag.Parse()
-
-	if err := run(*rawURL, *cols, *rows, *msgs, *sendInput); err != nil {
-		fmt.Fprintf(os.Stderr, "wsprobe: %v\n", err)
-		os.Exit(1)
+func runWSCmd(args []string) error {
+	fs := flag.NewFlagSet("probe ws", flag.ExitOnError)
+	rawURL := fs.String("url", "ws://localhost:8420/ws", "gateway WebSocket URL")
+	cols := fs.Int("cols", 120, "columns")
+	rows := fs.Int("rows", 32, "rows")
+	msgs := fs.Int("msgs", 8, "total server messages to read")
+	sendInput := fs.Bool("send-input", false, "also exercise the browser→herdr input path (sends Ctrl-L; do NOT use against a live session)")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+	return runWS(*rawURL, *cols, *rows, *msgs, *sendInput)
 }
 
-func run(rawURL string, cols, rows, msgs int, sendInput bool) error {
+func runWS(rawURL string, cols, rows, msgs int, sendInput bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return err
@@ -82,7 +79,7 @@ func run(rawURL string, cols, rows, msgs int, sendInput bool) error {
 	tally := map[string]int{}
 	firstFrame, firstDiff := false, false
 	for read := 0; read < msgs; read++ {
-		payload, err := readFrame(br)
+		payload, err := readWSFrame(br)
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
@@ -209,9 +206,10 @@ func writeText(w io.Writer, payload []byte) error {
 	return err
 }
 
-// readFrame reads one server (unmasked) text/binary frame payload, coalescing
-// continuation is not needed for our small JSON messages.
-func readFrame(r *bufio.Reader) ([]byte, error) {
+// readWSFrame reads one server (unmasked) text/binary frame payload; coalescing
+// continuation is not needed for our small JSON messages. Named to avoid
+// clashing with the wire-protocol frame reader used by the wire subcommand.
+func readWSFrame(r *bufio.Reader) ([]byte, error) {
 	b0, err := r.ReadByte()
 	if err != nil {
 		return nil, err

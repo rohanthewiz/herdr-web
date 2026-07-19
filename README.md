@@ -27,7 +27,7 @@ client + web renderer.
 | **OSC 8 hyperlinks** (click-to-open when mouse not captured) | ✅ |
 | **Window title** + **notify toasts** | ✅ |
 | Kitty graphics passthrough | ⏳ deferred |
-| Headless end-to-end verification (`cmd/wsprobe`, `cmd/smoke`) | ✅ handshake, frame, diffs, mouse-capture confirmed |
+| Headless end-to-end verification (`cmd/probe` — `wire` + `ws` subcommands) | ✅ handshake, frame, diffs, mouse-capture confirmed |
 | Browser→herdr input/mouse/paste exercised against a live session | ⏳ coded; not injected into the real session (gated) |
 
 The installed herdr 0.7.0 server speaks **protocol 14**; `internal/wire.ProtocolVersion`
@@ -37,43 +37,48 @@ size, so attaching a web client does not resize other clients' views.
 
 ## Run
 
-```bash
-# Build
-go build ./...
+Only one binary needs to be built and run: the **gateway**. There is no separate
+frontend build — the browser UI (`web/index.html`) is embedded into the gateway at
+compile time via `go:embed`.
 
-# Smoke-test the protocol directly against a running herdr server (read-only):
-go run ./cmd/smoke --socket ~/.config/herdr/herdr-client.sock --frames 2
+1. **Have a `herdr server` running** (the installed Rust herdr). The gateway is a thin
+   client — it attaches to an already-running herdr session over a Unix socket; it does
+   not start herdr itself. If you already use herdr in your terminal, this is satisfied.
 
-# Serve herdr in the browser:
-go run ./cmd/gateway --addr :8420
-# then open http://localhost:8420
-```
-
-### Starting the web client (step by step)
-
-1. **Have a `herdr server` running.** The gateway is a thin client — it attaches to an
-   already-running herdr session over a Unix socket; it does not start herdr itself.
-2. **Start the gateway:**
+2. **Build and run the gateway:**
 
    ```bash
    go run ./cmd/gateway --addr :8420
+   ```
+
+   Or build a durable binary:
+
+   ```bash
+   go build -o herdr-gateway ./cmd/gateway
+   ./herdr-gateway --addr :8420
    ```
 
 3. **Open `http://localhost:8420`** in your browser.
 
 `--socket` defaults to `~/.config/herdr/herdr-client.sock` (the default session). The
 gateway attaches to whatever session that socket belongs to, so the browser controls that
-live session — keystrokes reach its focused pane.
+live session — keystrokes reach its focused pane, tmux-style, alongside any terminal
+clients attached to the same session.
 
-> **Note:** `web/index.html` is embedded into the gateway binary at compile time
-> (`//go:embed`). After editing it, **restart the gateway** (`go run` recompiles and
-> re-embeds) — a browser reload alone will keep serving the old page.
+> **Note:** because `web/index.html` is compiled into the binary, after editing it you
+> must **restart the gateway** (`go run` recompiles and re-embeds) — a browser reload
+> alone will keep serving the old page.
 
-### Headless verification
+### Headless verification (optional)
+
+`cmd/probe` is a diagnostics tool — never needed just to use herdr in the browser:
 
 ```bash
+# Smoke-test the wire protocol directly against the herdr server (read-only, no gateway):
+go run ./cmd/probe wire --frames 2
+
 # Full browser↔gateway↔herdr frame round-trip, no browser needed (read-only):
-go run ./cmd/wsprobe --frames 1
+go run ./cmd/probe ws --msgs 8
 # add --send-input to also exercise the keyboard path (reaches the focused pane!)
 ```
 
@@ -83,8 +88,8 @@ go run ./cmd/wsprobe --frames 1
 internal/wire/        bincode codec, wire messages, framing, color decode
 internal/herdrconn/   herdr client connection (handshake, send/recv)
 cmd/gateway/          rweb web server + WebSocket bridge + embedded canvas UI
-cmd/smoke/            direct protocol smoke test (no web)
-cmd/wsprobe/          stdlib-only WebSocket client for end-to-end verification
+cmd/probe/            headless verification: `probe wire` (direct protocol smoke
+                      test) and `probe ws` (stdlib WebSocket client, end-to-end)
 ```
 
 ## What's next (migration roadmap)
