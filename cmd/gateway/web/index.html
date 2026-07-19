@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-<title>herdr</title>
+<title>herdr-web</title>
 <style>
   :root {
     --bg:#181818; --fg:#d4d4d4; --accent:#5b9dff; --panel:#141414; --panel2:#1d1d1d;
@@ -194,7 +194,7 @@
 <body>
 <div id="app">
   <aside id="sidebar">
-    <div id="brand">herdr</div>
+    <div id="brand">herdr-web</div>
     <section><h2>Workspaces</h2><ul id="ws-list"></ul></section>
     <section><h2>Panes</h2><ul id="pane-list"></ul></section>
     <section><h2>Agents</h2><ul id="agent-list"><li class="empty">none</li></ul></section>
@@ -762,9 +762,9 @@
         try { navigator.clipboard.writeText(b64decode(msg.data)); } catch (e) {}
         break;
       case "notify": handleNotify(msg); break;
-      case "title": document.title = msg.title ? ("herdr · " + msg.title) : "herdr"; break;
+      case "title": document.title = msg.title ? ("herdr-web · " + msg.title) : "herdr-web"; break;
       case "update_ready":
-        showBanner("herdr update ready" + (msg.version ? " — " + msg.version : "") +
+        showBanner("herdr-web update ready" + (msg.version ? " — " + msg.version : "") +
           (msg.command ? " · run: " + msg.command : ""));
         break;
       case "error": toast("error: " + msg.msg); break;
@@ -1263,7 +1263,7 @@
   function confirmStopServer() {
     dialogConfirm({
       title: "stop server",
-      message: "Stop the herdr server? Session state is saved and the persistent termhost daemon keeps your shells alive, but every browser disconnects.",
+      message: "Stop the herdr-web server? Session state is saved and the persistent termhost daemon keeps your shells alive, but every browser disconnects.",
       confirmLabel: "stop server", danger: true,
       onConfirm: () => sendCmd("server.stop", {}),
     });

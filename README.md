@@ -9,7 +9,7 @@ Three binaries make up the app:
 
 | Binary | Role |
 |--------|------|
-| `gateway` | The herdr server: workspace/tab/pane orchestrator, web UI over WebSocket, control + hook APIs, session persistence |
+| `gateway` | The herdr-web server: workspace/tab/pane orchestrator, web UI over WebSocket, control + hook APIs, session persistence |
 | `termhost` | Terminal backend daemon: owns PTYs + VT emulation (libghostty-vt) per pane; run `-persistent` so shells survive gateway restarts |
 | `herdrctl` | CLI client for the control API — the same command table the browser uses — plus offline agent-integration installers |
 
