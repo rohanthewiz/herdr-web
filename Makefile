@@ -10,7 +10,7 @@ GHOSTTY  := PKG_CONFIG_PATH=$(PC_DIR)
 TAGS     := -tags ghostty
 
 # The shipped binaries. The other cmd/ entries are development spikes.
-BINS     := gateway2 termhost herdrctl
+BINS     := gateway termhost herdrctl
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GOOS     := $(shell go env GOOS)
 GOARCH   := $(shell go env GOARCH)
@@ -54,7 +54,7 @@ binaries:
 
 dist: binaries
 	@mkdir -p $(DIST)
-	cp bin/gateway2 bin/termhost bin/herdrctl $(DIST)/
+	cp bin/gateway bin/termhost bin/herdrctl $(DIST)/
 	cp config.example.yaml README.md $(DIST)/
 	tar -czf $(DIST).tar.gz -C dist $(notdir $(DIST))
 	@echo "==> $(DIST).tar.gz"

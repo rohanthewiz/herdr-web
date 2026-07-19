@@ -1,13 +1,14 @@
 //go:build ghostty
 
-// Command termhost is the Phase B Go terminal backend daemon: it listens on a
-// Unix socket and serves the orchestration protocol (internal/orchestration),
-// owning PTYs + VT emulation per pane. The Rust herdr server connects to it as
-// the orchestrator (workspace/pane tree, layout, detection, session) and drives
-// panes through the seam.
+// Command termhost is the Go terminal backend daemon: it listens on a Unix
+// socket and serves the orchestration protocol (internal/orchestration),
+// owning PTYs + VT emulation per pane. The gateway (cmd/gateway) connects to
+// it as the orchestrator (workspace/pane tree, layout, detection, session)
+// and drives panes through the seam. Run with -persistent so panes survive a
+// gateway restart or upgrade.
 //
 // Build requires libghostty-vt on PKG_CONFIG_PATH and -tags ghostty;
-// see scripts/build-libghostty-vt.sh.
+// see `make vt` / scripts/build-libghostty-vt.sh.
 package main
 
 import (

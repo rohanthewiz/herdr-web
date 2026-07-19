@@ -132,7 +132,7 @@ func TestServeAndCallOverSocket(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer l.Close()
-	s := NewServer(syncDispatch(false), time.Second, "gateway2")
+	s := NewServer(syncDispatch(false), time.Second, "gateway")
 	go s.Serve(l)
 
 	// ping over the wire

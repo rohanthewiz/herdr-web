@@ -24,7 +24,7 @@ import (
 //     the pane): create_pane.initial_history replays it into the fresh
 //     emulator, the analogue of herdr's seed_history_ansi.
 //
-// A gateway2 restart against a live daemon needs none of the history — the
+// A gateway restart against a live daemon needs none of the history — the
 // PTYs survive in the daemon and reconcile adopts them; the model snapshot
 // alone restores the tree around them. History exists for the case where the
 // daemon is gone too (first run, daemon crash, reboot).
@@ -94,7 +94,7 @@ func (o *orch) saveNow() {
 		}
 	}
 	if err := persist.SaveSession(o.sessionPath, o.session.Snapshot(), cwds, agents); err != nil {
-		log.Printf("gateway2: save session state: %v", err)
+		log.Printf("gateway: save session state: %v", err)
 	}
 }
 
@@ -191,7 +191,7 @@ func (o *orch) histSaveNow() {
 		}
 	}
 	if err := persist.SaveHistory(o.historyPath, out); err != nil {
-		log.Printf("gateway2: save history state: %v", err)
+		log.Printf("gateway: save history state: %v", err)
 	}
 }
 

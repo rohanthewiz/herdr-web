@@ -7,7 +7,7 @@ import "slices"
 // client, plus the subscription filter. It lives in internal/app alongside the §7
 // command vocabulary so the event contract has one home, but unlike the unary
 // commands these are not routed through Dispatcher — the streaming transport
-// (internal/ctlproto) carries them and the orchestrator (cmd/gateway2) emits them.
+// (internal/ctlproto) carries them and the orchestrator (cmd/gateway) emits them.
 // They mirror the pane lifecycle/chrome the orchestrator already observes from the
 // terminal backend, flattened into an automation-friendly JSON stream (herdrctl
 // prints one per line); the browser's own richer down-messages live in browserproto.

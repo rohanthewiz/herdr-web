@@ -1,5 +1,5 @@
 // Command herdrctl is the local control-API client for a running herdr server
-// (cmd/gateway2). It speaks internal/ctlproto over the control unix socket and
+// (cmd/gateway). It speaks internal/ctlproto over the control unix socket and
 // drives the very same §7 command table as the browser front-end — the proof
 // that the app.Dispatcher seam serves a non-browser caller with no per-command
 // server code. It links no libghostty (untagged): it is a pure socket client.
@@ -219,7 +219,7 @@ func runEvents(socket, id string, params json.RawMessage) int {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `herdrctl — local control-API client for a running herdr server (cmd/gateway2)
+	fmt.Fprint(os.Stderr, `herdrctl — local control-API client for a running herdr server (cmd/gateway)
 
 Usage:
   herdrctl [flags] <verb> [args...]            ergonomic subcommand

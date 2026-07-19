@@ -30,7 +30,7 @@ func streamListener(t *testing.T, sd StreamDispatch) string {
 		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	s := NewServer(syncDispatch(false), time.Second, "gateway2")
+	s := NewServer(syncDispatch(false), time.Second, "gateway")
 	if sd != nil {
 		s.SetStreamDispatch(sd)
 	}

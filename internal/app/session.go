@@ -6,7 +6,7 @@
 // no daemon, no I/O, no goroutines, so it unit-tests like the layout/workspace
 // models it composes (the Rust src/app actions are the spec).
 //
-// The orchestrator runtime (the event-loop actor in cmd/gateway2) owns exactly
+// The orchestrator runtime (the event-loop actor in cmd/gateway) owns exactly
 // one Session and is its only caller, so Session needs no synchronization.
 package app
 

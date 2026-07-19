@@ -9,7 +9,7 @@ import (
 
 // handleCmd runs one §7 command from a browser. The command table itself lives in
 // internal/app (app.Dispatcher) so the same vocabulary can serve a CLI/control-API
-// too (see cmd/gateway2/control.go); here we just adapt the browser wire to the
+// too (see cmd/gateway/control.go); here we just adapt the browser wire to the
 // neutral seam: an app.JSONParamDecoder over the cmd's params and a browserResponder
 // that marshals the cmd_result back on this connection. orch itself implements
 // app.Backend (the runtime effects). Loop-goroutine only.

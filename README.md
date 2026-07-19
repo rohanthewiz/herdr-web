@@ -1,48 +1,50 @@
 # herdr-web
 
-A Go + web presentation tier for [herdr](https://herdr.dev). This is **Phase A** of
-an incremental migration of herdr off Rust onto a Go stack (rweb / Element / serr /
-logger), presented through the browser.
+[herdr](https://herdr.dev) in Go, presented through the browser: a terminal
+workspace manager for herding AI coding agents. This repo is the complete
+application — the Rust implementation is retired, and no Rust checkout is
+needed to build or run anything here.
 
-Phase A attaches to an **unmodified, already-running `herdr server`** as a wire-protocol
-client, receives herdr's fully-rendered semantic frames, and streams them to a browser
-canvas. No Rust build and no Zig toolchain are involved — the installed `herdr` binary
-does all terminal emulation and rendering; this gateway is a thin, language-agnostic
-client + web renderer.
+Three binaries make up the app:
 
-## Status
+| Binary | Role |
+|--------|------|
+| `gateway` | The herdr server: workspace/tab/pane orchestrator, web UI over WebSocket, control + hook APIs, session persistence |
+| `termhost` | Terminal backend daemon: owns PTYs + VT emulation (libghostty-vt) per pane; run `-persistent` so shells survive gateway restarts |
+| `herdrctl` | CLI client for the control API — the same command table the browser uses — plus offline agent-integration installers |
 
-| Piece | State |
-|-------|-------|
-| bincode v2 `standard` codec (`internal/wire`) | ✅ hand-written, validated against live server |
-| Wire messages: Hello / Input / Resize / Detach, Welcome / Frame / Shutdown | ✅ |
-| Color + modifier decode (`color.go`) | ✅ named / 256-palette / RGB → CSS |
-| herdr connection wrapper (`internal/herdrconn`) | ✅ handshake + typed send/recv |
-| rweb gateway: page + `/ws` WebSocket bridge (`cmd/gateway`) | ✅ one herdr client per browser tab |
-| Browser canvas renderer + keyboard input (`cmd/gateway/web/index.html`) | ✅ renders frames; key→bytes mapping |
-| **Frame diffing** (gateway sends only changed cells) | ✅ full frame ~53 KB → steady-state diffs ~100 B |
-| **Mouse input** (SGR 1006) gated on server `MouseCapture` | ✅ MouseCapture decodes; browser sends drag/wheel/click |
-| **Clipboard**: herdr→browser copy (OSC 52) | ✅ |
-| **Paste**: ⌘V text (`InputEvents::Paste`) / Ctrl+V image (`ClipboardImage` → staged file path) | ✅ verified end-to-end into Claude Code |
-| **OSC 8 hyperlinks** (click-to-open when mouse not captured) | ✅ |
-| **Window title** + **notify toasts** | ✅ |
-| Kitty graphics passthrough | ⏳ deferred |
-| Headless end-to-end verification (`cmd/wsprobe`, `cmd/smoke`) | ✅ handshake, frame, diffs, mouse-capture confirmed |
-| Browser→herdr input/mouse/paste exercised against a live session | ⏳ coded; not injected into the real session (gated) |
+## Features
 
-The installed herdr 0.7.0 server speaks **protocol 14**; `internal/wire.ProtocolVersion`
-matches. Proto 14 inserted `ServerMessage::WindowTitle` at index 7, shifting `MouseCapture`
-to 9 — handled in `internal/wire`. The server renders per-client at each client's requested
-size, so attaching a web client does not resize other clients' views.
+- **Workspaces → tabs → panes** with BSP splits, drag-to-resize, zoom, and
+  per-pane titles; all state is a single-owner event loop over one `app.Session`.
+- **Agent awareness**: panes detect the coding agent running in them (claude,
+  codex, kimi, …) via process inspection plus a manifest catalog that updates
+  from herdr.dev; agent hook reports (permission prompts, task completion)
+  arrive on a local hook socket and surface as badges/toasts.
+- **Session persistence & restore**: the model is saved to
+  `~/.local/state/herdr` on every mutation. A gateway restart re-adopts live
+  PTYs from the persistent termhost; a cold start re-spawns panes with captured
+  scrollback replayed, and `resume_agents` relaunches supported agents into
+  their native conversation sessions.
+- **Git worktrees**: create a worktree checkout per agent/task from the UI.
+- **Copy mode** with vim-style, rebindable keys; OSC 52 clipboard; OSC 8
+  hyperlinks; window-title and notification passthrough.
+- **Remote access**: shared-password login with HMAC-signed session cookies
+  (headless clients use a Bearer token) and optional TLS (self-signed
+  auto-generated, or bring your own cert).
+- **Configuration** in YAML (`~/.config/herdr/config.yaml`): server settings,
+  theme colors/font, and keybindings — see
+  [`config.example.yaml`](config.example.yaml). Theme/keybinding edits apply
+  with `herdrctl reload`, no restart.
 
 ## Build & packaging
 
 The VT engine (libghostty-vt, Zig) is vendored in `third_party/libghostty-vt`
-— the repo is self-contained; no Rust checkout is needed.
+— the repo is self-contained.
 
 ```bash
 make vt             # one-time: build the vendored libghostty-vt (downloads pinned Zig 0.15.2)
-make binaries       # gateway2 + termhost + herdrctl into bin/ (-tags ghostty)
+make binaries       # gateway + termhost + herdrctl into bin/ (-tags ghostty)
 make check          # everything CI runs: fmt, vet, untagged tests, tagged race tests
 make dist           # release tarball for this host's OS/arch into dist/
 ```
@@ -51,129 +53,84 @@ CI (`.github/workflows/ci.yml`) runs the untagged quick checks plus the
 ghostty-tagged race tests on Linux and macOS. A `v*` tag triggers
 `release.yml`, which attaches per-platform tarballs to the GitHub release.
 
+The CGO terminal path is behind the `ghostty` build tag: `gateway` and
+`termhost` need `-tags ghostty` + `PKG_CONFIG_PATH` (the Makefile wires this),
+while `herdrctl` and most `internal/` packages build and test with a plain
+`go build ./...` — no Zig toolchain required.
+
 ## Run
 
 ```bash
-# Build
-go build ./...
+# 1. Terminal backend (persistent: panes survive gateway restarts/upgrades)
+bin/termhost -socket /tmp/herdr-termhost.sock -persistent &
 
-# Smoke-test the protocol directly against a running herdr server (read-only):
-go run ./cmd/smoke --socket ~/.config/herdr/herdr-client.sock --frames 2
+# 2. The herdr server
+HERDR_PASSWORD=changeme bin/gateway --addr :8421
 
-# Serve herdr in the browser:
-go run ./cmd/gateway --addr :8420
-# then open http://localhost:8420
+# 3. Open http://localhost:8421 and sign in
 ```
 
-### Starting the web client (step by step)
+`gateway --auth none` skips the login for trusted localhost use; `--tls`
+serves HTTPS. Flags beat the config file, which beats built-in defaults
+(`flag > config > default`); run `gateway -h` for the full set.
 
-1. **Have a `herdr server` running.** The gateway is a thin client — it attaches to an
-   already-running herdr session over a Unix socket; it does not start herdr itself.
-2. **Start the gateway:**
+> **Note:** the web UI (`cmd/gateway/web/index.html`) is embedded into the
+> gateway binary at compile time (`//go:embed`) — after editing it, rebuild
+> and restart the gateway; a browser reload alone keeps serving the old page.
 
-   ```bash
-   go run ./cmd/gateway --addr :8420
-   ```
+### CLI control & automation
 
-3. **Open `http://localhost:8420`** in your browser.
-
-`--socket` defaults to `~/.config/herdr/herdr-client.sock` (the default session). The
-gateway attaches to whatever session that socket belongs to, so the browser controls that
-live session — keystrokes reach its focused pane.
-
-> **Note:** `web/index.html` is embedded into the gateway binary at compile time
-> (`//go:embed`). After editing it, **restart the gateway** (`go run` recompiles and
-> re-embeds) — a browser reload alone will keep serving the old page.
-
-### Headless verification
+`herdrctl` drives a running gateway over the owner-only control socket:
 
 ```bash
-# Full browser↔gateway↔herdr frame round-trip, no browser needed (read-only):
-go run ./cmd/wsprobe --frames 1
-# add --send-input to also exercise the keyboard path (reaches the focused pane!)
+herdrctl split h 2                      # split pane 2 horizontally
+herdrctl panes                          # list panes
+herdrctl wait 1 "BUILD SUCCESSFUL" 120  # block until pane 1 prints the pattern
+herdrctl events 1                       # stream pane events until Ctrl-C
+herdrctl reload                         # re-render page after config edits
+herdrctl help                           # the full verb list
 ```
+
+`herdrctl integration install claude` installs the herdr hook integration
+into an agent's own config tree (offline — no gateway needed); `wsprobe` is a
+stdlib-only WebSocket probe for exercising the browser protocol headlessly.
 
 ## Layout
 
 ```
-internal/wire/        bincode codec, wire messages, framing, color decode
-internal/herdrconn/   herdr client connection (handshake, send/recv)
-internal/terminal/    Phase B: Go-owned VT emulator (Emulator iface + go-libghostty)
-internal/orchestration/  Phase B: Go↔Rust seam (protocol + terminal-backend Host)
-cmd/gateway/          rweb web server + WebSocket bridge + embedded canvas UI
-cmd/smoke/            direct protocol smoke test (no web)
-cmd/wsprobe/          stdlib-only WebSocket client for end-to-end verification
-cmd/vtspike/          Phase B spike: drive a go-libghostty terminal in Go, read cells
-cmd/ptyspike/         Phase B spike: shell PTY -> internal/terminal.Emulator -> grid
-cmd/termhost/         Phase B: terminal-backend daemon (orchestration Host over a socket)
-scripts/build-libghostty-vt.sh   build libghostty-vt (Zig 0.15.2 + macOS-26 SDK patch)
+cmd/gateway/          herdr server: orchestrator event loop, web UI, WS bridge,
+                      control/hook APIs, persistence + restore, auth/TLS
+cmd/termhost/         terminal-backend daemon (orchestration Host over a socket)
+cmd/herdrctl/         control-API CLI + agent-integration installers (untagged)
+cmd/wsprobe/          stdlib-only WebSocket probe for the browser protocol
+internal/app/         session model + §7 command table (the Dispatcher seam)
+internal/browserproto/  browser WebSocket protocol (spec: ai_docs/phase-c-ws9-protocol.md)
+internal/orchestration/ gateway↔termhost seam (protocol + terminal-backend Host)
+internal/terminal/    VT emulator (Emulator iface + go-libghostty)
+internal/layout/      BSP pane layout
+internal/detect/      agent detection (process inspection + manifest catalog)
+internal/config/      YAML config (server / theme / keybindings)
+internal/persist/     on-disk session + history state
+internal/ctlproto/    control-API protocol + server
+internal/integration/ agent hook installers (claude, codex, kimi, …)
+internal/gwauth/, internal/gwtls/  login/cookie auth, TLS setup
+internal/worktree/    git-worktree creation
+third_party/libghostty-vt/  vendored VT engine source (Zig)
+scripts/build-libghostty-vt.sh  portable VT build (pinned Zig 0.15.2 + macOS SDK patch)
 ```
 
-The CGO terminal backend is behind the `ghostty` build tag, so the Phase A
-gateway still builds with a plain `go build ./...` (no Zig toolchain, no
-libghostty-vt). Only the Phase B code (`internal/terminal`, the spikes) needs
-`-tags ghostty` + `PKG_CONFIG_PATH`.
+**Toolchain note (macOS):** the macOS 26 SDK dropped the plain `arm64-macos`
+slice from its `.tbd` stubs and Zig 0.15.2 doesn't fall back arm64→arm64e, so
+a native build fails to link libSystem. `scripts/build-libghostty-vt.sh`
+patches a *copy* of the SDK to re-add the slice and points Zig at it via an
+`xcrun` shim. Zig itself is downloaded to `.tools/` (gitignored); no system
+changes are made.
 
-## Phase B spike (go-libghostty)
+## History
 
-A proof-of-concept that Go can own PTY + VT emulation via
-[go-libghostty](https://github.com/mitchellh/go-libghostty) is in `cmd/vtspike`
-(drive a terminal, read back per-cell glyph + fg/bg) and `cmd/ptyspike` (spawn a
-real shell PTY, pump it through the emulator, dump the grid). Both work on Apple
-Silicon / macOS 26.5. To build:
-
-```bash
-./scripts/build-libghostty-vt.sh          # builds the vendored libghostty-vt, prints PKG_CONFIG_PATH
-export PKG_CONFIG_PATH=$PWD/third_party/libghostty-vt/zig-out/share/pkgconfig
-go test -tags ghostty ./internal/terminal/   # Emulator round-trip tests
-go run  -tags ghostty ./cmd/vtspike
-go run  -tags ghostty ./cmd/ptyspike
-```
-
-The reusable piece is `internal/terminal`: an `Emulator` interface (`io.Writer`
-in, `Snapshot` of cells + cursor out) with a go-libghostty-backed implementation.
-The Phase B browser renderer will consume `Snapshot` the way the Phase A gateway
-consumes wire `FrameData`.
-
-### Go↔Rust orchestration seam
-
-`internal/orchestration` is the seam where Go becomes the **terminal backend**
-and Rust stays the **orchestrator** (workspace/pane tree, layout, detection,
-session, compositing). Rust sends commands (`create_pane` / `input` / `resize` /
-`close_pane`); Go runs a PTY + `Emulator` per pane and sends events
-(`pane_frame` / `pane_exited`). Frames are shaped to drop into Rust's
-`wire::FrameData`/`CellData` compositing (packed colors, ratatui modifier bits,
-`skip` diffing). The `Host` serves this over any connection; `cmd/termhost` is a
-Unix-socket daemon wrapping it. The protocol + frame conversion are pure Go
-(tested without the toolchain); the `Host` is behind `-tags ghostty`.
-
-Full design: [`ai_docs/phase-b-orchestration-seam.md`](ai_docs/phase-b-orchestration-seam.md).
-
-```bash
-go test ./internal/orchestration/                    # protocol/diff (no toolchain)
-go test -tags ghostty ./internal/orchestration/      # + end-to-end Host
-go run  -tags ghostty ./cmd/termhost --socket /tmp/herdr-termhost.sock
-```
-
-**Toolchain note (the Zig/SDK risk, now resolved):** libghostty-vt pins Zig
-0.15.x, but the macOS 26.5 SDK dropped the plain `arm64-macos` slice from its
-`.tbd` stubs (only `arm64e-macos` remains) and Zig 0.15.2 doesn't fall back
-arm64→arm64e, so its native build fails to link libSystem. The build script
-works around this by patching a copy of the SDK to re-add the `arm64-macos`
-slice and pointing Zig at it via an `xcrun` shim. Zig itself is downloaded to
-`.tools/` (gitignored); no system changes are made.
-
-## What's next (migration roadmap)
-
-- **Phase A polish:** mouse/wheel input, OSC 8 hyperlinks, Kitty graphics passthrough,
-  clipboard (OSC 52), frame diffing to cut bandwidth, per-tab isolation.
-- **Phase B:** move PTY + VT emulation into Go via `go.mitchellh.com/libghostty`
-  (go-libghostty), shrinking the Rust surface. **Spike done** (see above): the
-  toolchain builds and both the cell-grid and shell-PTY paths work end-to-end on
-  macOS 26.5. Done since: `internal/terminal` (Emulator wrapping go-libghostty)
-  and `internal/orchestration` (the Go↔Rust seam + terminal-backend Host /
-  `termhost` daemon). Remaining: the Rust side of the seam (drive panes through
-  `termhost`, splice Go pane frames into Rust compositing), OSC passthrough
-  (title/cwd/clipboard/hyperlinks), scrollback/selection, Go-side input encoding.
-- **Phase C:** port herdr's portable logic (app state, BSP layout, agent detection,
-  session/workspace) to Go and retire the Rust core.
+This codebase replaced the Rust/ratatui herdr through a phased migration:
+Phase A (a thin web client attached to the Rust server), Phase B (Go-owned
+PTY + VT emulation behind an orchestration seam), and Phase C (the
+orchestrator, layout, detection, persistence, and web chrome in Go). The
+design docs and per-workstream session notes live in
+[`ai_docs/`](ai_docs/); retired phase code is recoverable from git history.

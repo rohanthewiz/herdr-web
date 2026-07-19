@@ -331,7 +331,7 @@ func (o *orch) syncDaemon() {
 		if o.panes[pid] == nil {
 			enc, err := inputenc.New()
 			if err != nil {
-				log.Printf("gateway2: encoder: %v", err)
+				log.Printf("gateway: encoder: %v", err)
 				continue
 			}
 			o.panes[pid] = &paneRuntime{id: pid, enc: enc}
@@ -917,18 +917,18 @@ func (o *orch) DaemonConnected() bool       { return o.daemon.connected() }
 // on the loop goroutine; the HTTP handler reads o.page atomically.
 func (o *orch) ReloadConfig() error {
 	if o.cfgPath == "" || o.baseHTML == nil {
-		log.Printf("gateway2: server.reload_config — no config file in use; nothing to reload")
+		log.Printf("gateway: server.reload_config — no config file in use; nothing to reload")
 		return nil
 	}
 	cfg, path, err := config.Load(o.cfgPath)
 	if err != nil {
-		log.Printf("gateway2: server.reload_config failed: %v", err)
+		log.Printf("gateway: server.reload_config failed: %v", err)
 		return err
 	}
 	o.cfg = cfg // keep config.get / config.set working from the reloaded state
 	page := renderPage(o.baseHTML, cfg)
 	o.page.Store(&page)
-	log.Printf("gateway2: reloaded config from %s — theme + keybindings apply to new page loads; server settings need a restart", path)
+	log.Printf("gateway: reloaded config from %s — theme + keybindings apply to new page loads; server settings need a restart", path)
 	return nil
 }
 
@@ -951,7 +951,7 @@ func (o *orch) Shutdown() {
 func (o *orch) broadcast(m any) {
 	b, err := browserproto.Marshal(m)
 	if err != nil {
-		log.Printf("gateway2: marshal broadcast: %v", err)
+		log.Printf("gateway: marshal broadcast: %v", err)
 		return
 	}
 	for c := range o.conns {
@@ -962,7 +962,7 @@ func (o *orch) broadcast(m any) {
 func (o *orch) send(c *client, m any) {
 	b, err := browserproto.Marshal(m)
 	if err != nil {
-		log.Printf("gateway2: marshal: %v", err)
+		log.Printf("gateway: marshal: %v", err)
 		return
 	}
 	o.enqueue(c, b)
@@ -1037,7 +1037,7 @@ func (o *orch) enqueue(c *client, b []byte) {
 	select {
 	case c.out <- b:
 	default:
-		log.Printf("gateway2: dropping slow browser connection")
+		log.Printf("gateway: dropping slow browser connection")
 		o.dropConn(c)
 	}
 }
@@ -1121,7 +1121,7 @@ func (o *orch) serve(ws *rweb.WSConn) error {
 		up, err := browserproto.DecodeUp(m.Data)
 		if err != nil {
 			if !errors.Is(err, browserproto.ErrUnknownType) {
-				log.Printf("gateway2: bad up message: %v", err)
+				log.Printf("gateway: bad up message: %v", err)
 			}
 			continue // spec §1: unknown types are dropped
 		}
@@ -1190,7 +1190,7 @@ func (o *orch) handleUp(c *client, up any) {
 			return
 		}
 		if b, err := rt.enc.Key(*m); err != nil {
-			log.Printf("gateway2: key encode: %v", err)
+			log.Printf("gateway: key encode: %v", err)
 		} else if len(b) > 0 {
 			o.daemon.send(orchestration.NewInput(rt.id, b))
 		}
@@ -1202,7 +1202,7 @@ func (o *orch) handleUp(c *client, up any) {
 		}
 		b, err := rt.enc.Mouse(*m)
 		if err != nil {
-			log.Printf("gateway2: mouse encode: %v", err)
+			log.Printf("gateway: mouse encode: %v", err)
 			return
 		}
 		switch {
@@ -1219,7 +1219,7 @@ func (o *orch) handleUp(c *client, up any) {
 			return
 		}
 		if b, err := rt.enc.Paste(m.Data); err != nil {
-			log.Printf("gateway2: paste encode: %v", err)
+			log.Printf("gateway: paste encode: %v", err)
 		} else if len(b) > 0 {
 			o.daemon.send(orchestration.NewInput(rt.id, b))
 		}
@@ -1238,7 +1238,7 @@ func (o *orch) handleUp(c *client, up any) {
 		o.applyModel()
 
 	case *browserproto.Image:
-		o.send(c, browserproto.NewError(0, "image paste is not supported by the gateway2 spike"))
+		o.send(c, browserproto.NewError(0, "image paste is not supported by the gateway spike"))
 
 	case *browserproto.Cmd:
 		o.handleCmd(c, m)

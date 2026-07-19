@@ -88,16 +88,16 @@ func serveControl(o *orch, socket string) (cleanup func(), err error) {
 		return nil, err
 	}
 	if err := os.Chmod(socket, 0o600); err != nil {
-		log.Printf("gateway2: control socket chmod: %v", err)
+		log.Printf("gateway: control socket chmod: %v", err)
 	}
-	srv := ctlproto.NewServer(o.controlDispatch, controlTimeout, "gateway2")
+	srv := ctlproto.NewServer(o.controlDispatch, controlTimeout, "gateway")
 	srv.SetStreamDispatch(o.controlStream) // events.subscribe
 	go func() {
 		if err := srv.Serve(l); err != nil {
-			log.Printf("gateway2: control server stopped: %v", err)
+			log.Printf("gateway: control server stopped: %v", err)
 		}
 	}()
-	log.Printf("gateway2: control API listening on %s", socket)
+	log.Printf("gateway: control API listening on %s", socket)
 	return func() { _ = l.Close(); _ = os.Remove(socket) }, nil
 }
 

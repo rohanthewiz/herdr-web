@@ -1,4 +1,4 @@
-// Package persist is gateway2's on-disk session state (WS3): the model
+// Package persist is gateway's on-disk session state (WS3): the model
 // snapshot that survives a gateway restart (session.json) and the captured
 // scrollback seeds that survive a termhost daemon loss (history.json). Two
 // files because they have different rhythms — the model is small and written

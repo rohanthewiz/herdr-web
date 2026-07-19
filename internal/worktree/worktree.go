@@ -1,4 +1,4 @@
-// Package worktree is the pure logic behind gateway2's git-worktree feature
+// Package worktree is the pure logic behind gateway's git-worktree feature
 // (port of the Rust src/worktree.rs): branch/path slug derivation, the
 // `git worktree` command builders, the `worktree list --porcelain` parser, and
 // the dirty-remove error detection the two-step force confirmation keys on.

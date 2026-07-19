@@ -124,7 +124,7 @@ func serveHooks(o *orch, socket string) (cleanup func(), err error) {
 		return nil, err
 	}
 	if err := os.Chmod(socket, 0o600); err != nil {
-		log.Printf("gateway2: hook socket chmod: %v", err)
+		log.Printf("gateway: hook socket chmod: %v", err)
 	}
 	go func() {
 		for {
@@ -135,7 +135,7 @@ func serveHooks(o *orch, socket string) (cleanup func(), err error) {
 			go o.serveHookConn(conn.(*net.UnixConn))
 		}
 	}()
-	log.Printf("gateway2: hook-report API listening on %s", socket)
+	log.Printf("gateway: hook-report API listening on %s", socket)
 	return func() { _ = l.Close(); _ = os.Remove(socket) }, nil
 }
 

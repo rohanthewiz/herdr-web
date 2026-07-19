@@ -114,7 +114,7 @@ func (r *fakeResponder) Fail(msg string) {
 	r.errMsg = msg
 }
 
-// jsonDec mirrors gateway2's browser param decoder: empty ⇒ ErrNoParams.
+// jsonDec mirrors gateway's browser param decoder: empty ⇒ ErrNoParams.
 type jsonDec struct{ raw []byte }
 
 func (d jsonDec) Decode(v any) error {

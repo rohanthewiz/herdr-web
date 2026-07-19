@@ -1,4 +1,4 @@
-// Package config is gateway2's optional YAML configuration file. It is a second
+// Package config is gateway's optional YAML configuration file. It is a second
 // source of settings alongside the command-line flags: for the server settings
 // the precedence is flag > config > built-in default (main.go applies the flag
 // layer via flag.Visit); the front-end settings (theme colours and copy-mode
@@ -6,7 +6,7 @@
 // served page.
 //
 // A missing file is not an error — every field has a default (Default), so an
-// empty or absent config yields the same behaviour gateway2 had before configs
+// empty or absent config yields the same behaviour gateway had before configs
 // existed. Absent scalar keys keep their defaults; the theme and keybinding maps
 // merge key-wise, so a config that sets one colour or rebinds one action keeps
 // the defaults for everything it does not mention.
@@ -32,7 +32,7 @@ import (
 // the default location).
 const EnvVar = "HERDR_CONFIG"
 
-// Config is the whole gateway2 configuration file.
+// Config is the whole gateway configuration file.
 type Config struct {
 	Server      Server      `yaml:"server"`
 	Persistence Persistence `yaml:"persistence"`
@@ -142,7 +142,7 @@ var defaultCopyMode = map[string][]string{
 	"exit":       {"Escape", "q"},
 }
 
-// Default is the configuration gateway2 uses with no config file. Every call
+// Default is the configuration gateway uses with no config file. Every call
 // returns fresh maps so callers can mutate the result without affecting the
 // package globals or each other.
 func Default() Config {

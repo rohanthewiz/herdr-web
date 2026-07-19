@@ -33,7 +33,7 @@ func buildWorkspace(t *testing.T) *Workspace {
 	return ws
 }
 
-// recordingSpawner mirrors gateway2's modelSpawner: pure, deterministic ids.
+// recordingSpawner mirrors gateway's modelSpawner: pure, deterministic ids.
 func recordingSpawner() PaneSpawner { return modelStubSpawner{} }
 
 type modelStubSpawner struct{}

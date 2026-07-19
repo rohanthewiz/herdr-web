@@ -1,6 +1,6 @@
-# herdr gateway2 configuration (YAML).
+# herdr gateway configuration (YAML).
 #
-# Copy to ~/.config/herdr/config.yaml (or point at it with `gateway2 --config
+# Copy to ~/.config/herdr/config.yaml (or point at it with `gateway --config
 # <path>` / the HERDR_CONFIG env var). Every field is optional — omit anything
 # you don't want to change and the built-in default is used. For the server
 # settings a command-line flag still wins over this file, which wins over the

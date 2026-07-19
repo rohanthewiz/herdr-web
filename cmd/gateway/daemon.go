@@ -46,7 +46,7 @@ func (d *daemon) send(m any) {
 		return
 	}
 	if err := orchestration.WriteMessage(d.conn, m); err != nil {
-		log.Printf("gateway2: daemon write: %v", err)
+		log.Printf("gateway: daemon write: %v", err)
 		_ = d.conn.Close() // the pump's read fails and triggers redial
 	}
 }
@@ -63,14 +63,14 @@ func (d *daemon) run() {
 	for {
 		conn, err := net.DialTimeout("unix", d.socket, 3*time.Second)
 		if err != nil {
-			log.Printf("gateway2: termhost dial: %v (retrying in %s)", err, backoff)
+			log.Printf("gateway: termhost dial: %v (retrying in %s)", err, backoff)
 			time.Sleep(backoff)
 			backoff = min(backoff*2, 5*time.Second)
 			continue
 		}
 		backoff = time.Second
 		if err := d.session(conn); err != nil {
-			log.Printf("gateway2: termhost session: %v", err)
+			log.Printf("gateway: termhost session: %v", err)
 		}
 		_ = conn.Close()
 		d.setConn(nil)
@@ -314,7 +314,7 @@ func (d *daemon) dispatch(mt orchestration.MessageType, payload []byte) {
 		if err := json.Unmarshal(payload, &ev); err != nil {
 			return
 		}
-		log.Printf("gateway2: daemon error (pane %d): %s", ev.PaneID, ev.Message)
+		log.Printf("gateway: daemon error (pane %d): %s", ev.PaneID, ev.Message)
 		o.post(func() { o.broadcast(browserproto.NewError(ev.PaneID, ev.Message)) })
 	}
 }

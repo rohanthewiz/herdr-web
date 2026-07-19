@@ -5,7 +5,7 @@
 //
 // The model is deliberately minimal because herdr is single-user: there is one
 // secret, no user table. A browser exchanges the secret once at /login for a
-// session cookie; a headless client (wsprobe2, scripts) presents the secret
+// session cookie; a headless client (wsprobe, scripts) presents the secret
 // directly as an Authorization: Bearer token. Session cookies are signed with a
 // per-process random key, so restarting the gateway invalidates outstanding
 // sessions (re-login required) and no secret is ever written to disk.
@@ -132,7 +132,7 @@ func GenerateSecret() (string, error) {
 // policy does not apply to it, and it must still pass the secret/cookie check.
 func OriginOK(origin, host string) bool {
 	if origin == "" {
-		return true // non-browser client (e.g. wsprobe2); auth is still enforced
+		return true // non-browser client (e.g. wsprobe); auth is still enforced
 	}
 	u, err := url.Parse(origin)
 	if err != nil || u.Host == "" {

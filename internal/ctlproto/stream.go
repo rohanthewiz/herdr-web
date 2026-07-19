@@ -31,7 +31,7 @@ type Subscriber interface {
 // StreamDispatch starts a streaming method. It validates method+params, registers
 // sub as the sink for matching events, and returns cancel — called when the client
 // disconnects — to unregister it. A non-nil error rejects the subscription (bad
-// params, unknown method), reported to the client as a failed ack. For gateway2
+// params, unknown method), reported to the client as a failed ack. For gateway
 // this posts the registration onto the orchestrator loop and returns a cancel that
 // posts the removal.
 type StreamDispatch func(method string, params json.RawMessage, sub Subscriber) (cancel func(), err error)

@@ -13,7 +13,7 @@ import (
 
 // Dispatch runs one §7 command from the control API. An implementation decodes
 // params via app.JSONParamDecoder and drives the neutral app.Dispatcher,
-// resolving r with the command's result. For gateway2 this posts onto the
+// resolving r with the command's result. For gateway this posts onto the
 // orchestrator loop so the dispatch runs on the single state-owning goroutine
 // (which also implements app.Backend); synchronous commands resolve r inline,
 // while read/capture resolve it later when the daemon reply arrives.
