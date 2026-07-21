@@ -17,7 +17,7 @@ GOARCH   := $(shell go env GOARCH)
 DIST     := dist/herdr-web_$(VERSION)_$(GOOS)_$(GOARCH)
 
 .PHONY: all vt build test build-ghostty test-ghostty race-ghostty binaries \
-        dist fmt-check vet vet-ghostty check clean
+        local dist fmt-check vet vet-ghostty check clean
 
 all: binaries
 
@@ -49,6 +49,20 @@ binaries:
 	@mkdir -p bin
 	$(foreach b,$(BINS),$(GHOSTTY) go build $(TAGS) -trimpath -o bin/$(b) ./cmd/$(b) &&) true
 	@ls -lh bin
+
+# --- personal install --------------------------------------------------------
+
+# Build each shipped binary straight into ~/bin under a short alias.
+# The map is "cmd:alias" pairs — edit here to rename or add targets. Splitting
+# on ':' keeps the source dir (./cmd/$(cmd)) decoupled from the installed name.
+LOCAL_BIN := $(HOME)/bin
+LOCAL_MAP := gateway:hway termhost:thost herdrctl:hctl
+
+local:
+	@mkdir -p $(LOCAL_BIN)
+	$(foreach p,$(LOCAL_MAP),$(GHOSTTY) go build $(TAGS) -trimpath \
+	    -o $(LOCAL_BIN)/$(word 2,$(subst :, ,$(p))) ./cmd/$(word 1,$(subst :, ,$(p))) &&) true
+	@for p in $(LOCAL_MAP); do ls -lh $(LOCAL_BIN)/$${p#*:}; done
 
 # --- packaging ----------------------------------------------------------------
 
